@@ -354,9 +354,23 @@ class TestQueueRegister:
 
     def test_when_already_in_queue_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        # session_no must match the mocked active session (guap-mon-2 -> 2):
-        # the duplicate check is per session since the queue-filtering fix.
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "2", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+
+        cookie = _make_student_cookie()
+        with pytest.raises(HTTPException) as exc:
+            main_module.queue_register(
+                _mock_request({"student_session": cookie}),
+                "dev-course", "4431", "1",
+            )
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "ALREADY_IN_QUEUE"
+
+    def test_when_already_in_queue_of_other_session_returns_409(self, deps):
+        # Правило продукта: одновременно может быть только одна ждущая запись
+        # на лабу за день, даже если студент "стоит" в другой сессии. Повторно
+        # встать (в конец) можно только после "сдал"/"не явился"/"отозван".
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:

@@ -410,8 +410,8 @@ def register(
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
         rows = read_queue_rows(worksheet)
-        # Duplicate check: a student cannot be waiting twice for the same lab
-        # in the same session. Different sessions are allowed.
+        # Duplicate check ignores session_no: a student cannot be waiting
+        # twice for the same lab on the same day, even across sessions.
         already_waiting = [
             row
             for row in rows
@@ -419,7 +419,6 @@ def register(
             and row.lab == lab
             and row.fio == fio
             and row.status == STATUS_WAITING
-            and (session_no is None or row.session_no == session_no)
         ]
         if already_waiting:
             raise QueueError("ALREADY_IN_QUEUE", "Участник уже ожидает")
