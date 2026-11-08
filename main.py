@@ -84,7 +84,7 @@ from grading.schedule import (
     load_schedule_data,
     parse_schedule_file,
     refresh_all_groups,
-    schedule_path_for_course,
+    schedule_path_for_course, parse_course_schedule,
 )
 
 from grading.queue.errors import QueueError
@@ -936,6 +936,29 @@ def get_course_labs(request: Request, course_id: str, group_id: str):
 
     available_labs = [lab for lab in labs if lab in headers]
     return available_labs
+
+
+@app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}")
+@limiter.limit("30/minute")
+def get_lab_details(request: Request, course_id: str, group_id: str, lab_id: str):
+    """Get lab details by lab_id (short-name)."""
+    course_info = get_course_by_id(course_id)
+    
+    # Find lab in visible labs
+    labs = visible_labs(course_info)
+    lab = next((lab for lab in labs if lab.get("short-name") == lab_id), None)
+    
+    if not lab:
+        raise HTTPException(status_code=404, detail=f"Lab {lab_id!r} not found")
+    
+    return {
+        "id": lab.get("id"),
+        "short-name": lab.get("short-name"),
+        "name": lab.get("name"),
+        "repo-provisioning": lab.get("repo-provisioning"),
+        "template-repo": lab.get("template-repo"),
+        "github-prefix": lab.get("github-prefix"),
+    }
 
 
 @app.post("/courses/{course_id}/groups/{group_id}/register")
@@ -3409,6 +3432,21 @@ def queue_shift(
 
 # --- List ---
 
+def _get_session_no_from_request(request: Request) -> int | None:
+    """Extract session_no from query parameters."""
+    try:
+        session_no = request.query_params.get("session_no")
+    except KeyError:
+        # query_string not present in scope (e.g., in tests)
+        return None
+    if session_no is not None:
+        try:
+            return int(session_no)
+        except ValueError:
+            return None
+    return None
+
+
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue")
 @limiter.limit("30/minute")
 def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
@@ -3420,11 +3458,26 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
     if session is None:
         return {"queue": [], "size": 0, "is_team_lab": is_team_lab(lab_config), "queue_open": False}
 
+    # Get session_no from query params (optional)
+    session_no = _get_session_no_from_request(request)
+
     spreadsheet = _open_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
     rows = read_queue_rows(worksheet)
+
+    # Filter by group_id, lab, status, and session_no
+    lab_short_name = lab_config.get("short-name", lab_key)
+    filtered_rows = [
+        r for r in rows
+        if r.group == group_id
+        and r.lab == lab_short_name
+        and r.status == STATUS_WAITING
+        and (session_no is None or r.session_no == session_no)
+    ]
+    # Sort by position
+    filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
 
     return {
         "queue": [
@@ -3436,9 +3489,9 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
                 "session_no": r.session_no,
                 "status": r.status,
             }
-            for r in rows
+            for r in filtered_rows
         ],
-        "size": len(rows),
+        "size": len(filtered_rows),
         "is_team_lab": is_team_lab(lab_config),
         "queue_open": True,
     }

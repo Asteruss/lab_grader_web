@@ -354,7 +354,9 @@ class TestQueueRegister:
 
     def test_when_already_in_queue_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        # session_no must match the mocked active session (guap-mon-2 -> 2):
+        # the duplicate check is per session since the queue-filtering fix.
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "2", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -516,7 +518,7 @@ class TestQueueShift:
 
 
 class TestQueueList:
-    def test_list_returns_all_rows(self, deps):
+    def test_list_returns_waiting_rows_for_group(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
         ws.append_row([2, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
@@ -527,8 +529,11 @@ class TestQueueList:
             _mock_request({"student_session": cookie}),
             "dev-course", "4431", "1",
         )
-        assert data["size"] == 3
-        assert len(data["queue"]) == 3
+        # Only WAITING status rows for group 4431 are returned
+        assert data["size"] == 2
+        assert len(data["queue"]) == 2
+        assert all(r["status"] == STATUS_WAITING for r in data["queue"])
+        assert all(r["group"] == "4431" for r in data["queue"])
 
     def test_without_any_cookie_returns_queue(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)

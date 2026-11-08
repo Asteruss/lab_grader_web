@@ -16,6 +16,7 @@ import {
 } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import {
+  extractSessionNo,
   fetchDefenseQueue,
   fetchDefenseQueueStatus,
   registerAndCheck,
@@ -77,12 +78,20 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
   const [notice, setNotice] = useState(null);
   const [shiftBy, setShiftBy] = useState("1");
 
+  // Число (примитив), а не объект сессии: эффект зависит только от sessionNo,
+  // иначе каждый reload создаёт новый объект status.session и зацикливает
+  // бесконечные запросы.
+  const sessionNo = useMemo(
+    () => extractSessionNo(status?.session),
+    [status?.session]
+  );
+
   const reload = useCallback(async () => {
     setError(null);
     try {
       const [currentStatus, queueData] = await Promise.all([
-        fetchDefenseQueueStatus(courseId, groupId, labId),
-        fetchDefenseQueue(courseId, groupId, labId),
+        fetchDefenseQueueStatus(courseId, groupId, labId, sessionNo),
+        fetchDefenseQueue(courseId, groupId, labId, sessionNo),
       ]);
       setStatus(validateStatus(currentStatus));
       setQueue(normalizeQueue(queueData));
@@ -93,15 +102,15 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
     } finally {
       setLoading(false);
     }
-  }, [courseId, groupId, labId]);
+  }, [courseId, groupId, labId, sessionNo]);
 
   useEffect(() => {
     let active = true;
     setLoading(true);
     setError(null);
     Promise.all([
-      fetchDefenseQueueStatus(courseId, groupId, labId),
-      fetchDefenseQueue(courseId, groupId, labId),
+      fetchDefenseQueueStatus(courseId, groupId, labId, sessionNo),
+      fetchDefenseQueue(courseId, groupId, labId, sessionNo),
     ])
       .then(([currentStatus, queueData]) => {
         if (!active) return;
@@ -120,7 +129,7 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
     return () => {
       active = false;
     };
-  }, [courseId, groupId, labId]);
+  }, [courseId, groupId, labId, sessionNo]);
 
   const handleJoinQueue = async () => {
     setBusy(true);
@@ -160,7 +169,7 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
     setError(null);
     setNotice(null);
     try {
-      await shiftDefenseQueue(courseId, groupId, labId, Number(shiftBy));
+      await shiftDefenseQueue(courseId, groupId, labId, Number(shiftBy), sessionNo);
       setNotice(t("queue.shifted"));
       await reload();
     } catch (requestError) {

@@ -85,11 +85,34 @@ const requestDefenseQueue = async (url, options = {}) => {
   return data;
 };
 
-export const fetchDefenseQueueStatus = (courseId, groupId, labId) =>
-  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/status`);
+export const fetchDefenseQueueStatus = (courseId, groupId, labId, sessionNo) => {
+  const url = new URL(`${defenseQueueUrl(courseId, groupId, labId)}/status`);
+  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
+  return requestDefenseQueue(url.toString());
+};
 
-export const fetchDefenseQueue = (courseId, groupId, labId) =>
-  requestDefenseQueue(defenseQueueUrl(courseId, groupId, labId));
+export const fetchDefenseQueue = (courseId, groupId, labId, sessionNo) => {
+  const url = new URL(defenseQueueUrl(courseId, groupId, labId));
+  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
+  return requestDefenseQueue(url.toString());
+};
+
+export const fetchLabDetails = async (courseId, groupId, labId) => {
+  const url = `${API_BASE_URL}/courses/${encodeURIComponent(courseId)}/groups/${encodeURIComponent(groupId)}/labs/${encodeURIComponent(labId)}`;
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    const error = new Error("Failed to fetch lab details");
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+};
+
+export const extractSessionNo = (session) => {
+  if (!session?.slot_id) return null;
+  const digits = session.slot_id.match(/\d+/g);
+  return digits ? parseInt(digits[digits.length - 1], 10) : null;
+};
 
 export const registerForDefenseQueue = (courseId, groupId, labId) =>
   requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/register`, {
@@ -101,12 +124,15 @@ export const withdrawFromDefenseQueue = (courseId, groupId, labId) =>
     method: "POST",
   });
 
-export const shiftDefenseQueue = (courseId, groupId, labId, delta) =>
-  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/shift`, {
+export const shiftDefenseQueue = (courseId, groupId, labId, delta, sessionNo) => {
+  const url = new URL(`${defenseQueueUrl(courseId, groupId, labId)}/shift`);
+  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
+  return requestDefenseQueue(url.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ delta }),
   });
+};
 
 
 // --- Секретная ссылка /j/{token} (docs/SECRET_JOIN_LINKS_PLAN.md §7, §10) ---
@@ -415,4 +441,3 @@ export async function gradeLab(courseId, groupId, labId, github) {
 
   return data;
 }
-
