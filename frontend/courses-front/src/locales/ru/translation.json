@@ -263,6 +263,8 @@
       "group": "Группа",
       "name": "Студент",
       "lab": "ЛР",
+      "github": "GitHub",
+      "time": "Время",
       "status": "Статус"
     },
     "errors": {
@@ -301,6 +303,9 @@
     "teamTitle": "Ваша команда",
     "teamMembers": "Участники",
     "unnamedEntry": "Участник",
+    "githubLabel": "GitHub",
+    "signupTimeLabel": "Записался",
+    "signupTimeEmpty": "—",
     "statuses": {
       "ждёт": "ждёт",
       "сдал": "сдал",

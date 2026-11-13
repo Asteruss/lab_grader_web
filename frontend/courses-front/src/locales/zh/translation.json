@@ -266,6 +266,8 @@
       "group": "Group",
       "name": "Student",
       "lab": "Lab",
+      "github": "GitHub",
+      "time": "登记时间",
       "status": "Status"
     },
     "errors": {
@@ -304,6 +306,9 @@
     "teamTitle": "您的团队",
     "teamMembers": "成员",
     "unnamedEntry": "学生",
+    "githubLabel": "GitHub",
+    "signupTimeLabel": "登记时间",
+    "signupTimeEmpty": "—",
     "statuses": {
       "ждёт": "等待中",
       "сдал": "已通过",

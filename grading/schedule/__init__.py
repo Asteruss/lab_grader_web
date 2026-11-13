@@ -119,7 +119,20 @@ def parse_schedule_file(path: str | Path, course_id: str | None = None) -> dict[
             raise ScheduleConfigError(f"{where}: group IDs must be non-empty")
         merged_config = {**defaults, **group_cfg}
         _validate_group(str(group_id), merged_config, where)
-        sources[str(group_id)] = ManualScheduleSource(
+        source_name = str(merged_config.get("source", "manual"))
+        if source_name == "guap":
+            # GUAP is a sync source: ``refresh_all_groups`` materializes
+            # fetched lessons into ``group_cfg['slots']`` at refresh time.
+            # At runtime we read those materialized slots via
+            # ManualScheduleSource, exactly as before.
+            source_cls = ManualScheduleSource
+        else:
+            # Honor the Strategy + Registry contract documented in
+            # registry.py: a source registered via @register_source(name)
+            # and selected via ``source: name`` in the YAML is instantiated
+            # here without further code changes.
+            source_cls = get_source_class(source_name)
+        sources[str(group_id)] = source_cls(
             course_id=str(course_id),
             group_id=str(group_id),
             group_cfg=merged_config,

@@ -2977,6 +2977,23 @@ def _queue_today_str(course_info: dict) -> str:
     return datetime.now(tz).date().isoformat()
 
 
+def _queue_now_str(course_info: dict) -> str:
+    """Current time HH:MM in the course timezone (for the signup-time column)."""
+    tz_str = course_info.get("timezone", "UTC+3")
+    match = re.fullmatch(r"UTC([+-])(\d{1,2})", tz_str)
+    if match:
+        sign = 1 if match.group(1) == "+" else -1
+        from datetime import timezone, timedelta
+        tz = timezone(sign * timedelta(hours=int(match.group(2))))
+    else:
+        from zoneinfo import ZoneInfo
+        try:
+            tz = ZoneInfo(tz_str)
+        except (KeyError, ValueError):
+            tz = timezone.utc
+    return datetime.now(tz).strftime("%H:%M")
+
+
 def _open_spreadsheet(course_info: dict):
     """Open the course's Google Sheets spreadsheet."""
     spreadsheet_id = course_info.get("google", {}).get("spreadsheet")
@@ -3166,7 +3183,17 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "error": e.code,
         }
 
-    entry = find_waiting(rows, group_id, lab_short_name, fio) if fio else None
+    entry = (
+        find_waiting(
+            rows,
+            group_id,
+            lab_short_name,
+            fio,
+            github="" if is_team_lab(lab_config) else username,
+        )
+        if fio
+        else None
+    )
 
     # Check ALREADY_PASSED
     history_ws = None
@@ -3301,13 +3328,18 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    # Register in queue
+    # Register in queue. Team rows keep an empty GitHub: any team member
+    # must be able to withdraw/shift the entry, and the team is already
+    # unambiguously identified by its title (the row's FIO).
     from datetime import date
     today = date.fromisoformat(today_str)
     group_ids = _schedule_group_ids(course_id)
+    signup_time = _queue_now_str(course_info)
     try:
         position = _queue_register(
-            spreadsheet, today, group_id, fio, lab_short_name, session_no, group_ids
+            spreadsheet, today, group_id, fio, lab_short_name, session_no, group_ids,
+            github="" if is_team_lab(lab_config) else username,
+            signup_time=signup_time,
         )
     except QueueError as e:
         raise _queue_error_to_http(e)
@@ -3354,7 +3386,10 @@ def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str)
     today = date.fromisoformat(today_str)
 
     try:
-        _queue_withdraw(spreadsheet, today, group_id, fio, lab_short_name, session_no)
+        _queue_withdraw(
+            spreadsheet, today, group_id, fio, lab_short_name, session_no,
+            github="" if is_team_lab(lab_config) else username,
+        )
     except QueueError as e:
         raise _queue_error_to_http(e)
 
@@ -3402,7 +3437,8 @@ def queue_shift(
 
     try:
         old_pos, new_pos = _queue_shift_down(
-            spreadsheet, today, group_id, fio, lab_short_name, body.delta
+            spreadsheet, today, group_id, fio, lab_short_name, body.delta,
+            github="" if is_team_lab(lab_config) else username,
         )
     except QueueError as e:
         raise _queue_error_to_http(e)
@@ -3439,6 +3475,8 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
                 "lab": r.lab,
                 "session_no": r.session_no,
                 "status": r.status,
+                "github": r.github,
+                "signup_time": r.signup_time,
             }
             for r in rows
         ],
@@ -3478,6 +3516,8 @@ def admin_queue_today(
                 "lab": r.lab,
                 "session_no": r.session_no,
                 "status": r.status,
+                "github": r.github,
+                "signup_time": r.signup_time,
             }
             for r in rows
         ],

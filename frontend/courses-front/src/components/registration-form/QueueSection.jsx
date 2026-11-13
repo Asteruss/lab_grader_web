@@ -66,6 +66,17 @@ const entryName = (entry) =>
   entry.title ||
   "";
 
+const entryMeta = (entry, t) => {
+  const github = entry.github ? String(entry.github).trim() : "";
+  const signupTime = entry.signup_time ? String(entry.signup_time).trim() : "";
+  if (!github && !signupTime) return null;
+  const parts = [];
+  if (github) parts.push(`${t("queue.githubLabel")}: ${github}`);
+  if (signupTime) parts.push(`${t("queue.signupTimeLabel")}: ${signupTime}`);
+  else parts.push(`${t("queue.signupTimeLabel")}: ${t("queue.signupTimeEmpty")}`);
+  return parts.join(" · ");
+};
+
 // eslint-disable-next-line react/prop-types
 export function QueueSection({ courseId, groupId, labId, formData }) {
   const { t, i18n } = useTranslation();
@@ -353,6 +364,8 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
                               </Typography>
                             </Stack>
                           }
+                          secondary={entryMeta(entry, t) || undefined}
+                          secondaryTypographyProps={{ variant: "caption", color: "text.secondary" }}
                         />
                       </ListItem>
                     );

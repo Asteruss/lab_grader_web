@@ -14,8 +14,12 @@ from .locks import locked_course
 QUEUE_SHEET_PREFIX = "Очередь-"
 HISTORY_SHEET = "История_очереди"
 
-QUEUE_HEADERS = ["ПОЗИЦИЯ", "ГРУППА", "ФИО", "ЛР", "Пар№", "Статус"]
-HISTORY_HEADERS = ["Дата", "ПОЗИЦИЯ", "ГРУППА", "ФИО", "ЛР", "Пар№", "Статус"]
+QUEUE_HEADERS = ["ПОЗИЦИЯ", "ГРУППА", "ФИО", "ЛР", "Пар№", "GitHub", "Время", "Статус"]
+HISTORY_HEADERS = ["Дата", "ПОЗИЦИЯ", "ГРУППА", "ФИО", "ЛР", "Пар№", "GitHub", "Время", "Статус"]
+
+# Column letters in the daily queue sheet (1-based index into QUEUE_HEADERS).
+STATUS_COL = len(QUEUE_HEADERS)  # «Статус» is the last column
+STATUS_COL_LETTER = chr(ord("A") + STATUS_COL - 1)
 
 STATUS_WAITING = "ждёт"
 STATUS_PASSED = "сдал"
@@ -43,6 +47,8 @@ class QueueRow:
     session_no: int | None
     status: str
     row_index: int
+    github: str = ""
+    signup_time: str = ""
 
 
 
@@ -139,21 +145,21 @@ def _setup_new_sheet(
 
     if queue:
         requests.append(
-            _filter_view("Все ждёт", worksheet.id, {5: STATUS_WAITING})
+            _filter_view("Все ждёт", worksheet.id, {7: STATUS_WAITING})
         )
         requests.append(
-            _filter_view("Сдано", worksheet.id, {5: STATUS_PASSED})
+            _filter_view("Сдано", worksheet.id, {7: STATUS_PASSED})
         )
         requests.append(
-            _filter_view("Не сдал", worksheet.id, {5: STATUS_FAILED})
+            _filter_view("Не сдал", worksheet.id, {7: STATUS_FAILED})
         )
         requests.append({
             "setDataValidation": {
                 "range": {
                     "sheetId": worksheet.id,
                     "startRowIndex": 1,
-                    "startColumnIndex": 5,
-                    "endColumnIndex": 6,
+                    "startColumnIndex": 7,
+                    "endColumnIndex": 8,
                 },
                 "rule": {
                     "condition": {
@@ -260,8 +266,10 @@ def read_queue_rows(worksheet) -> list[QueueRow]:
                 fio=padded[2].strip(),
                 lab=padded[3].strip(),
                 session_no=_safe_int(padded[4]),
-                status=padded[5].strip(),
+                status=padded[7].strip(),
                 row_index=row_index,
+                github=padded[5].strip(),
+                signup_time=padded[6].strip(),
             )
         )
     return rows
@@ -287,12 +295,24 @@ def list_waiting(
     )
 
 
+def _identity_matches(
+    row: QueueRow,
+    github: str,
+) -> bool:
+    """Identity check for #15: a row belongs to the caller only when the
+    GitHub logins agree. Legacy rows without a stored GitHub (and team rows,
+    which are registered with an empty GitHub) fall back to matching by FIO.
+    """
+    return not github or not row.github or row.github == github
+
+
 def find_waiting(
     rows: Iterable[QueueRow],
     group: str,
     lab: str,
     fio: str,
     session_no: int | None = None,
+    github: str = "",
 ) -> QueueRow | None:
     matches = [
         row
@@ -302,6 +322,7 @@ def find_waiting(
         and row.fio == fio
         and row.status == STATUS_WAITING
         and (session_no is None or row.session_no == session_no)
+        and _identity_matches(row, github)
     ]
     if len(matches) > 1:
         raise QueueError(
@@ -317,6 +338,7 @@ def _unique_row(
     lab: str,
     fio: str,
     session_no: int | None = None,
+    github: str = "",
 ) -> QueueRow:
     matches = [
         row
@@ -326,6 +348,7 @@ def _unique_row(
         and row.fio == fio
         and row.status == STATUS_WAITING
         and (session_no is None or row.session_no == session_no)
+        and _identity_matches(row, github)
     ]
     if not matches:
         raise QueueError("NOT_IN_QUEUE", "Ожидающая запись не найдена")
@@ -347,11 +370,11 @@ def find_in_history(
     """Whether *(group, fio, lab, status)* already exists in the history sheet."""
     values = history_worksheet.get_all_values()
     return any(
-        len(row) >= 7
+        len(row) >= len(HISTORY_HEADERS)
         and row[2].strip() == group
         and row[3].strip() == fio
         and row[4].strip() == lab
-        and row[6].strip() == status
+        and row[8].strip() == status
         for row in values[1:]
     )
 
@@ -405,6 +428,8 @@ def register(
     lab: str,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
+    github: str = "",
+    signup_time: str = "",
 ) -> int:
     """Append a waiting row and return its 1-based position."""
     with locked_course(spreadsheet.id):
@@ -412,6 +437,8 @@ def register(
         rows = read_queue_rows(worksheet)
         # Duplicate check ignores session_no: a student cannot be waiting
         # twice for the same lab on the same day, even across sessions.
+        # GitHub is part of the identity (#15): students sharing a FIO
+        # hold separate entries.
         already_waiting = [
             row
             for row in rows
@@ -419,6 +446,7 @@ def register(
             and row.lab == lab
             and row.fio == fio
             and row.status == STATUS_WAITING
+            and _identity_matches(row, github)
         ]
         if already_waiting:
             raise QueueError("ALREADY_IN_QUEUE", "Участник уже ожидает")
@@ -426,9 +454,9 @@ def register(
         waiting = list_waiting(rows, group, lab, session_no)
         position = len(waiting) + 1
         worksheet.append_row(
-            [position, group, fio, lab, session_no or "", STATUS_WAITING],
+            [position, group, fio, lab, session_no or "", github, signup_time, STATUS_WAITING],
             value_input_option="RAW",
-            table_range="A1:F",
+            table_range="A1:H",
         )
         return position
 
@@ -441,6 +469,7 @@ def withdraw(
     lab: str,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
+    github: str = "",
 ) -> None:
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
@@ -449,6 +478,7 @@ def withdraw(
             row
             for row in rows
             if row.group == group and row.lab == lab and row.fio == fio
+            and _identity_matches(row, github)
         ]
         waiting = [row for row in matching if row.status == STATUS_WAITING]
         if not waiting:
@@ -463,7 +493,7 @@ def withdraw(
         row = waiting[0]
         _write_cells(
             worksheet,
-            [{"range": f"F{row.row_index}", "values": [[STATUS_WITHDRAWN]]}],
+            [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WITHDRAWN]]}],
         )
         _renumber_waiting(worksheet, group, lab, session_no)
 
@@ -477,6 +507,7 @@ def shift_down(
     delta: int,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
+    github: str = "",
 ) -> tuple[int, int]:
     if isinstance(delta, bool) or not isinstance(delta, int) or delta < 1:
         raise QueueError(
@@ -488,7 +519,7 @@ def shift_down(
         waiting = list_waiting(
             read_queue_rows(worksheet), group, lab, session_no
         )
-        row = _unique_row(waiting, group, lab, fio, session_no)
+        row = _unique_row(waiting, group, lab, fio, session_no, github=github)
         current_index = waiting.index(row)
         new_index = min(current_index + delta, len(waiting) - 1)
         if new_index == current_index:
@@ -538,7 +569,7 @@ def set_status(
         row = waiting[0]
         _write_cells(
             worksheet,
-            [{"range": f"F{row.row_index}", "values": [[status]]}],
+            [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[status]]}],
         )
         _renumber_waiting(worksheet, group, lab, session_no)
 
@@ -608,7 +639,7 @@ def snapshot_sheet(spreadsheet, sheet_name: str) -> int:
         existing_counts = _read_history_counts_for_date(history, sheet_date)
         seen_counts: dict[tuple[str, str, str, str, str], int] = {}
 
-        new_rows: list[tuple[str, str, str, str, str, str, str]] = []
+        new_rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
         for row in rows:
             key = _history_row_key(
                 sheet_date,
@@ -631,7 +662,9 @@ def snapshot_sheet(spreadsheet, sheet_name: str) -> int:
                     row.fio,                        # 3: ФИО
                     row.lab,                        # 4: ЛР
                     str(row.session_no or ""),      # 5: Пар№
-                    final_status,                   # 6: Статус
+                    row.github,                     # 6: GitHub
+                    row.signup_time,                # 7: Время
+                    final_status,                   # 8: Статус
                 )
             )
 
@@ -640,16 +673,18 @@ def snapshot_sheet(spreadsheet, sheet_name: str) -> int:
             history_rows = [
                 {
                     "values": [
-                        {"userEnteredValue": {"stringValue": d}}, 
-                        {"userEnteredValue": {"stringValue": p}}, 
-                        {"userEnteredValue": {"stringValue": g}}, 
-                        {"userEnteredValue": {"stringValue": f}}, 
-                        {"userEnteredValue": {"stringValue": l}}, 
+                        {"userEnteredValue": {"stringValue": d}},
+                        {"userEnteredValue": {"stringValue": p}},
+                        {"userEnteredValue": {"stringValue": g}},
+                        {"userEnteredValue": {"stringValue": f}},
+                        {"userEnteredValue": {"stringValue": l}},
                         {"userEnteredValue": {"stringValue": sn}},
-                        {"userEnteredValue": {"stringValue": s}}, 
+                        {"userEnteredValue": {"stringValue": gh}},
+                        {"userEnteredValue": {"stringValue": t}},
+                        {"userEnteredValue": {"stringValue": s}},
                     ]
                 }
-                for d, p, g, f, l, sn, s in new_rows
+                for d, p, g, f, l, sn, gh, t, s in new_rows
             ]
             requests.append(
                 {
