@@ -274,7 +274,11 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
                 variant="contained"
                 color="primary"
                 size="large"
-                disabled={busy || !formReady}
+                disabled={
+                  busy ||
+                  !formReady ||
+                  (!status.session_required && status.can_register !== true)
+                }
                 onClick={handleJoinQueue}
               >
                 {t(busy ? "queue.working" : "queue.register")}
