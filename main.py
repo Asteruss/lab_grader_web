@@ -3087,8 +3087,9 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     """Current queue status for the authenticated student.
 
     The queue sheet is NOT created unless there is an active class session
-    today. If no session, returns queue_open=False without touching the
-    spreadsheet. Viewing the queue (queue_size, queue list) is public;
+    today. If no session, registration is closed but today's sheet is only
+    read (never created): students already waiting stay visible until they
+    are served. Viewing the queue (queue_size, queue list) is public;
     only personal data (position, CI status) requires student_session.
     """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
@@ -3098,11 +3099,41 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     next_sess = _queue_next_session(course_id, group_id, lab_key)
 
     if session is None:
-        # No class today - do NOT create the queue sheet
+        # No active class now: new registrations are closed, but students
+        # who are already waiting must stay visible until they are served —
+        # the day's queue outlives the session window. Read today's sheet
+        # if it exists; never create it here.
+        try:
+            spreadsheet = _open_spreadsheet(course_info)
+            today_str = _queue_today_str(course_info)
+            _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+        except Exception as e:
+            # A storage read failure must not break the "closed" view.
+            logger.warning(f"queue_status: cannot read today's queue outside session: {e}")
+            rows = []
+
+        lab_short_name = lab_config.get("short-name", lab_key)
+        waiting = list_waiting(rows, group_id, lab_short_name)
+
+        student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
+        student = parse_student_session(signer, student_cookie)
+        session_required = (
+            student is None
+            or student.get("course_id") != course_id
+            or student.get("group_id") != group_id
+        )
+
+        # Team labs are not resolved in this branch: without an active
+        # session we do not make GitHub network calls just for viewing.
+        entry = None
+        if not is_team_lab(lab_config) and not session_required:
+            fio = student.get("fio", "")
+            entry = find_waiting(rows, group_id, lab_short_name, fio) if fio else None
+
         return {
-            "in_queue": False,
-            "position": None,
-            "queue_size": 0,
+            "in_queue": entry is not None,
+            "position": entry.position if entry else None,
+            "queue_size": len(waiting),
             "ci_status": "unknown",
             "can_register": False,
             "already_passed": False,
@@ -3111,7 +3142,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "queue_open": False,
             "session": None,
             "next_session": _session_dict(next_sess) if next_sess else None,
-            "session_required": False,
+            "session_required": session_required,
         }
 
     # Session is active - create the sheet and get queue size
@@ -3447,6 +3478,21 @@ def _get_session_no_from_request(request: Request) -> int | None:
     return None
 
 
+def _read_today_queue_if_exists(spreadsheet, today_str: str):
+    """Read today's queue rows without creating the sheet.
+
+    Returns (worksheet, rows). When the sheet does not exist yet (nothing
+    was registered today), returns (None, []): the sheet is only ever
+    created when registration is actually open (active session).
+    """
+    from gspread.exceptions import WorksheetNotFound
+    try:
+        worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
+    except WorksheetNotFound:
+        return None, []
+    return worksheet, read_queue_rows(worksheet)
+
+
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue")
 @limiter.limit("30/minute")
 def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
@@ -3456,7 +3502,44 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
     # Only create the sheet if there is an active session
     session = _queue_active_session(course_id, group_id, lab_key)
     if session is None:
-        return {"queue": [], "size": 0, "is_team_lab": is_team_lab(lab_config), "queue_open": False}
+        # Registration is closed, but students who are already waiting must
+        # stay visible until they are served — the day's queue outlives the
+        # session window. Read the sheet if it exists; never create it here.
+        try:
+            spreadsheet = _open_spreadsheet(course_info)
+            today_str = _queue_today_str(course_info)
+            _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+        except Exception as e:
+            # A storage read failure must not break the "closed" view.
+            logger.warning(f"queue_list: cannot read today's queue outside session: {e}")
+            rows = []
+
+        lab_short_name = lab_config.get("short-name", lab_key)
+        session_no = _get_session_no_from_request(request)
+        filtered_rows = [
+            r for r in rows
+            if r.group == group_id
+            and r.lab == lab_short_name
+            and r.status == STATUS_WAITING
+            and (session_no is None or r.session_no == session_no)
+        ]
+        filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
+        return {
+            "queue": [
+                {
+                    "position": r.position,
+                    "group": r.group,
+                    "fio": r.fio,
+                    "lab": r.lab,
+                    "session_no": r.session_no,
+                    "status": r.status,
+                }
+                for r in filtered_rows
+            ],
+            "size": len(filtered_rows),
+            "is_team_lab": is_team_lab(lab_config),
+            "queue_open": False,
+        }
 
     # Get session_no from query params (optional)
     session_no = _get_session_no_from_request(request)
@@ -3511,13 +3594,12 @@ def admin_queue_today(
     spreadsheet = _open_spreadsheet(course_info)
     today_str = _queue_today_str(course_info)
 
-    from gspread.exceptions import WorksheetNotFound
-    try:
-        worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    except WorksheetNotFound:
-        return {"queue": [], "size": 0, "date": today_str}
-
-    rows = read_queue_rows(worksheet)
+    _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+    rows = list(rows)
+    # Sort by position: after shift_down positions change but the physical
+    # row order in the sheet does not, and the teacher must see the queue
+    # in call order (same rule as store.list_waiting).
+    rows.sort(key=lambda r: (r.position or 0, r.row_index))
     return {
         "queue": [
             {

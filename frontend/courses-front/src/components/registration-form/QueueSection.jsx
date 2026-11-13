@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Box,
@@ -86,50 +86,57 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
     [status?.session]
   );
 
-  const reload = useCallback(async () => {
-    setError(null);
-    try {
-      const [currentStatus, queueData] = await Promise.all([
-        fetchDefenseQueueStatus(courseId, groupId, labId, sessionNo),
-        fetchDefenseQueue(courseId, groupId, labId, sessionNo),
-      ]);
-      setStatus(validateStatus(currentStatus));
-      setQueue(normalizeQueue(queueData));
-    } catch (requestError) {
-      setStatus(null);
-      setQueue([]);
-      setError(requestError);
-    } finally {
-      setLoading(false);
-    }
-  }, [courseId, groupId, labId, sessionNo]);
+  // Guard against out-of-order responses: every load gets a sequence
+  // number and a response that arrives after a newer request has started
+  // (or after unmount) is discarded instead of overwriting fresh state.
+  // Without it a slow "Обновить" GET could arrive after "Записаться" and
+  // hide the entry that was just confirmed (review: stale reload).
+  const requestSeq = useRef(0);
+  const isMountedRef = useRef(false);
 
-  useEffect(() => {
-    let active = true;
-    setLoading(true);
-    setError(null);
-    Promise.all([
-      fetchDefenseQueueStatus(courseId, groupId, labId, sessionNo),
-      fetchDefenseQueue(courseId, groupId, labId, sessionNo),
-    ])
-      .then(([currentStatus, queueData]) => {
-        if (!active) return;
+  const loadQueue = useCallback(
+    async ({ showLoading = false } = {}) => {
+      const seq = ++requestSeq.current;
+      if (showLoading) {
+        setLoading(true);
+      }
+      setError(null);
+      try {
+        const [currentStatus, queueData] = await Promise.all([
+          fetchDefenseQueueStatus(courseId, groupId, labId, sessionNo),
+          fetchDefenseQueue(courseId, groupId, labId, sessionNo),
+        ]);
+        if (seq !== requestSeq.current) return; // stale response - discard
         setStatus(validateStatus(currentStatus));
         setQueue(normalizeQueue(queueData));
-      })
-      .catch((requestError) => {
-        if (!active) return;
+      } catch (requestError) {
+        if (seq !== requestSeq.current) return; // stale failure - discard
         setStatus(null);
         setQueue([]);
         setError(requestError);
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
+      } finally {
+        if (seq === requestSeq.current && isMountedRef.current) {
+          setLoading(false);
+        }
+      }
+    },
+    [courseId, groupId, labId, sessionNo],
+  );
+
+  // Silent reload for post-mutation refreshes: the caller already shows
+  // feedback (notice), so no loading spinner is needed.
+  const reload = useCallback(() => loadQueue({ showLoading: false }), [loadQueue]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
     return () => {
-      active = false;
+      isMountedRef.current = false;
     };
-  }, [courseId, groupId, labId, sessionNo]);
+  }, []);
+
+  useEffect(() => {
+    loadQueue({ showLoading: true });
+  }, [loadQueue]);
 
   const handleJoinQueue = async () => {
     setBusy(true);

@@ -326,6 +326,25 @@ class TestQueueStatus:
         assert data["can_register"] is False
         assert data["next_session"] is not None
 
+    def test_status_keeps_waiting_entry_after_session_ends(self, deps, monkeypatch):
+        # После конца пары новые записи запрещены, но уже ожидающий студент
+        # остаётся видимым, пока его не примут (до конца дня).
+        monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
+
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", STATUS_WAITING])
+
+        cookie = _make_student_cookie()
+        data = main_module.queue_status(
+            _mock_request({"student_session": cookie}),
+            "dev-course", "4431", "1",
+        )
+        assert data["queue_open"] is False
+        assert data["can_register"] is False
+        assert data["in_queue"] is True
+        assert data["position"] == 1
+        assert data["queue_size"] == 1
+
 
 class TestQueueRegister:
     def test_register_success(self, deps):
@@ -361,6 +380,33 @@ class TestQueueRegister:
             main_module.queue_register(
                 _mock_request({"student_session": cookie}),
                 "dev-course", "4431", "1",
+            )
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "ALREADY_IN_QUEUE"
+
+    def test_when_already_in_queue_for_other_lab_returns_409(self, deps, monkeypatch):
+        # Правило продукта: "одновременно — одна запись". Пока студент ждёт
+        # по одной лабе, записаться на другую нельзя; повторно встать (в
+        # конец) можно только после "сдал"/"не явился"/"отозван".
+        course = _fake_course_info()
+        course["labs"]["2"] = {
+            "short-name": "ЛР2",
+            "github-prefix": "lab2",
+            "template-repo": "test-org/lab2-template",
+            "repo-provisioning": "generate",
+            "files": ["main.py"],
+            "ci": ["workflows"],
+        }
+        monkeypatch.setattr(main_module, "get_course_by_id", lambda cid: course)
+
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+
+        cookie = _make_student_cookie()
+        with pytest.raises(HTTPException) as exc:
+            main_module.queue_register(
+                _mock_request({"student_session": cookie}),
+                "dev-course", "4431", "2",
             )
         assert exc.value.status_code == 409
         assert exc.value.detail == "ALREADY_IN_QUEUE"
@@ -573,6 +619,21 @@ class TestQueueList:
         assert data["size"] == 0
         assert data["queue"] == []
 
+    def test_list_keeps_waiting_entries_after_session_ends(self, deps, monkeypatch):
+        # После конца пары список не обнуляется: ожидающие остаются видны,
+        # порядок выдачи - по номеру позиции (Alice сдвинулась на 2, Bob на 1).
+        monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
+
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([2, "4431", "Alice", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([1, "4431", "Bob", "ЛР1", "1", STATUS_WAITING])
+
+        data = main_module.queue_list(_mock_request(), "dev-course", "4431", "1")
+        assert data["queue_open"] is False
+        assert data["size"] == 2
+        assert [r["fio"] for r in data["queue"]] == ["Bob", "Alice"]
+        assert [r["position"] for r in data["queue"]] == [1, 2]
+
 
 class TestQueueSetStatus:
     def test_set_status_success(self, deps):
@@ -696,3 +757,34 @@ class TestQueueErrors:
                 "dev-course", "4431", "999",
             )
         assert exc.value.status_code == 404
+
+
+class TestQueueAdminToday:
+    def test_today_queue_sorted_by_position_after_shift(self, deps):
+        # После shift позиции меняются, но физический порядок строк в листе
+        # остаётся прежним; админ должен видеть очередь в порядке вызова.
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([2, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
+
+        admin_cookie = _make_admin_cookie()
+        data = main_module.admin_queue_today(
+            _mock_request({"admin_session": admin_cookie}),
+            "dev-course",
+            admin="admin",
+        )
+        assert data["size"] == 2
+        assert [r["fio"] for r in data["queue"]] == ["Bob", "Alice"]
+        assert [r["position"] for r in data["queue"]] == [1, 2]
+
+    def test_today_queue_empty_when_sheet_missing(self, deps, monkeypatch):
+        monkeypatch.setattr(main_module, "_queue_today_str", lambda ci: "2026-01-01")
+        admin_cookie = _make_admin_cookie()
+        data = main_module.admin_queue_today(
+            _mock_request({"admin_session": admin_cookie}),
+            "dev-course",
+            admin="admin",
+        )
+        assert data["queue"] == []
+        assert data["size"] == 0
+        assert data["date"] == "2026-01-01"
