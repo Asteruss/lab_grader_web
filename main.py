@@ -82,6 +82,7 @@ from grading.schedule import (
     GuapScheduleSource,
     manual_course_groups,
     load_schedule_data,
+    parse_course_schedule,
     parse_schedule_file,
     refresh_all_groups,
     schedule_path_for_course,
