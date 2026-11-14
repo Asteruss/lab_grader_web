@@ -332,7 +332,7 @@ class TestQueueStatus:
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
 
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         data = main_module.queue_status(
@@ -425,7 +425,7 @@ class TestQueueRegister:
         monkeypatch.setattr(main_module, "get_course_by_id", lambda cid: course)
 
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -441,7 +441,7 @@ class TestQueueRegister:
         # на лабу за день, даже если студент "стоит" в другой сессии. Повторно
         # встать (в конец) можно только после "сдал"/"не явился"/"отозван".
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -711,8 +711,8 @@ class TestQueueList:
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
 
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([2, "4431", "Alice", "ЛР1", "1", STATUS_WAITING])
-        ws.append_row([1, "4431", "Bob", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([2, "4431", "Alice", "ЛР1", "1", "", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Bob", "ЛР1", "1", "", "", STATUS_WAITING])
 
         data = main_module.queue_list(_mock_request(), "dev-course", "4431", "1")
         assert data["queue_open"] is False
