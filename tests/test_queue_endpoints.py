@@ -705,12 +705,11 @@ class TestQueueList:
             _mock_request({"student_session": cookie}),
             "dev-course", "4431", "1",
         )
-        # Waiting rows plus finished ones (kept visible, dimmed in UI);
-        # "size" counts only the waiting queue.
-        assert data["size"] == 2
+        # All entries returned (waiting + finished), positions preserved.
+        assert data["size"] == 3
         assert len(data["queue"]) == 3
         assert [r["status"] for r in data["queue"]] == [
-            STATUS_WAITING, STATUS_WAITING, STATUS_PASSED,
+            STATUS_WAITING, STATUS_PASSED, STATUS_WAITING,
         ]
         assert all(r["group"] == "4431" for r in data["queue"])
 

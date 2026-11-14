@@ -193,13 +193,12 @@ def test_withdraw_and_set_status_leave_history_rows_and_renumber_waiting():
     set_status(spreadsheet, date(2026, 11, 8), "4431", "Петров", "ЛР1", STATUS_PASSED)
     rows = read_queue_rows(sheet)
 
+    # No renumbering after set_status anymore - positions preserved
     assert [(row.fio, row.position, row.status) for row in rows] == [
         ("Иванов", 1, STATUS_WITHDRAWN),
         ("Петров", 1, STATUS_PASSED),
-        ("Сидоров", 1, STATUS_WAITING),
+        ("Сидоров", 2, STATUS_WAITING),
     ]
-    assert rows[0].position == 1
-    assert rows[1].position == 1
 
 
 def test_status_validation_and_waiting_only_transitions():

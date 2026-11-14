@@ -480,7 +480,17 @@ def register(
             raise QueueError("ALREADY_IN_QUEUE", "Участник уже ожидает")
 
         waiting = list_waiting(rows, group, lab, session_no)
-        position = len(waiting) + 1
+        # Position after all existing entries in this (group, lab, session) scope,
+        # including finished ones, so new entries don't collide with finished positions.
+        in_scope = [
+            row
+            for row in rows
+            if row.group == group
+            and row.lab == lab
+            and (session_no is None or row.session_no == session_no)
+        ]
+        max_pos = max((row.position for row in in_scope if row.position), default=0)
+        position = max_pos + 1
         worksheet.append_row(
             [position, group, fio, lab, session_no or "", github, signup_time, STATUS_WAITING],
             value_input_option="RAW",
@@ -605,7 +615,6 @@ def set_status(
             worksheet,
             [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[status]]}],
         )
-        _renumber_waiting(worksheet, group, lab, session_no)
 
 
 def call_next(

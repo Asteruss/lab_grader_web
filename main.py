@@ -3169,7 +3169,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "in_queue": entry is not None or called_entry is not None,
             "position": entry.position if entry else None,
             "called": called_entry is not None,
-            "queue_size": len(waiting),
+            "queue_size": len(rows),
             "ci_status": "unknown",
             "can_register": False,
             "already_passed": False,
@@ -3248,7 +3248,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         return {
             "in_queue": False,
             "position": None,
-            "queue_size": len(waiting),
+            "queue_size": len(rows),
             "ci_status": "unknown",
             "can_register": False,
             "already_passed": False,
@@ -3317,7 +3317,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         "in_queue": entry is not None or called_entry is not None,
         "position": entry.position if entry else None,
         "called": called_entry is not None,
-        "queue_size": len(waiting),
+        "queue_size": len(rows),
         "ci_status": ci_status,
         "can_register": can_register,
         "already_passed": already_passed,
@@ -3595,8 +3595,7 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
             and r.lab == lab_short_name
             and (session_no is None or r.session_no == session_no)
         ]
-        filtered_rows.sort(key=lambda r: (_view_rank(r), r.position or 0, r.row_index))
-        waiting_count = sum(1 for r in filtered_rows if r.status == STATUS_WAITING)
+        filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
         return {
             "queue": [
                 {
@@ -3611,7 +3610,7 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
                 }
                 for r in filtered_rows
             ],
-            "size": waiting_count,
+            "size": len(filtered_rows),
             "is_team_lab": is_team_lab(lab_config),
             "queue_open": False,
         }
@@ -3625,8 +3624,6 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
     worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
     rows = read_queue_rows(worksheet)
 
-    # Filter by group_id, lab, and session_no. Called and finished entries
-    # stay visible so students see outcomes (dimmed in UI).
     lab_short_name = lab_config.get("short-name", lab_key)
     filtered_rows = [
         r for r in rows
@@ -3634,9 +3631,7 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
         and r.lab == lab_short_name
         and (session_no is None or r.session_no == session_no)
     ]
-    filtered_rows.sort(key=lambda r: (_view_rank(r), r.position or 0, r.row_index))
-    waiting_count = sum(1 for r in filtered_rows if r.status == STATUS_WAITING)
-
+    filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
     return {
         "queue": [
             {
@@ -3651,7 +3646,7 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
             }
             for r in filtered_rows
         ],
-        "size": waiting_count,
+        "size": len(filtered_rows),
         "is_team_lab": is_team_lab(lab_config),
         "queue_open": True,
     }
