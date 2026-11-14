@@ -40,10 +40,16 @@ def ensure_ci_passed(
 ) -> tuple[QueueSheetContext, StudentOutcome]:
     """Run the same grade decision used by ``/grade`` and enforce CI pass.
 
-    The verdict comes from ``outcome.passed``, not from the cell value or
-    the outcome status — a ``rejected`` outcome (cell protected) may still
-    carry ``passed == True`` when the student already has ``v`` from a
+    The verdict comes from ``outcome.ci_passed`` (a boolean), not from the
+    cell value or the ``outcome.passed`` summary string (which is a
+    human-readable label like "3/4 тестов пройдено" and must not be tested
+    for truthiness). A ``rejected`` outcome (cell protected) may still
+    carry ``ci_passed == True`` when the student already has ``v`` from a
     previous run and CI is green on the current HEAD.
+
+    This function NEVER writes to the grade cell: queue operations must
+    leave the teacher's evaluation cells untouched (review defect #2).
+    The ``/grade`` endpoint performs its own write via ``evaluate_student``.
 
     Before calling ``evaluate_student`` the function checks two early-exit
     conditions that do not require a GitHub round-trip:
@@ -82,7 +88,7 @@ def ensure_ci_passed(
         raise QueueError("CI_CHECK_FAILED", outcome.message)
 
     if outcome.status == "rejected":
-        if outcome.passed:
+        if outcome.ci_passed:
             return target, outcome
         raise QueueError("CI_NOT_PASSED", outcome.message or "CI не пройден")
 
@@ -92,19 +98,10 @@ def ensure_ci_passed(
             outcome.message or "Неизвестный результат проверки",
         )
 
-    try:
-        target.worksheet.update_cell(
-            target.row_index,
-            target.lab_column,
-            outcome.cell_value,
-        )
-    except Exception as error:
-        raise QueueError(
-            "SHEETS_UNAVAILABLE",
-            "Не удалось записать результат проверки",
-        ) from error
-
-    if not outcome.passed:
+    # Defect #2: an "updated" outcome means "/grade WOULD write this value".
+    # The queue must not: registration only checks CI eligibility and never
+    # touches the evaluation cell (neither "v" on success nor "x" on failure).
+    if not outcome.ci_passed:
         raise QueueError("CI_NOT_PASSED", outcome.message)
 
     return target, outcome

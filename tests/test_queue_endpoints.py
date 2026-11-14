@@ -290,7 +290,7 @@ class TestQueueStatus:
 
     def test_when_already_in_queue(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         data = main_module.queue_status(
@@ -303,7 +303,7 @@ class TestQueueStatus:
 
     def test_when_already_passed_in_history(self, deps):
         history = deps.worksheet("История_очереди")
-        history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", STATUS_PASSED])
+        history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", "", "", STATUS_PASSED])
 
         cookie = _make_student_cookie()
         data = main_module.queue_status(
@@ -332,7 +332,7 @@ class TestQueueStatus:
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
 
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         data = main_module.queue_status(
@@ -398,7 +398,7 @@ class TestQueueRegister:
 
     def test_when_already_in_queue_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -425,7 +425,7 @@ class TestQueueRegister:
         monkeypatch.setattr(main_module, "get_course_by_id", lambda cid: course)
 
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -441,7 +441,7 @@ class TestQueueRegister:
         # на лабу за день, даже если студент "стоит" в другой сессии. Повторно
         # встать (в конец) можно только после "сдал"/"не явился"/"отозван".
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -454,7 +454,7 @@ class TestQueueRegister:
 
     def test_when_already_passed_returns_400(self, deps):
         history = deps.worksheet("История_очереди")
-        history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", STATUS_PASSED])
+        history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", "", "", STATUS_PASSED])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -576,7 +576,7 @@ class TestQueueRegister:
 class TestQueueWithdraw:
     def test_withdraw_success(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         data = main_module.queue_withdraw(
@@ -602,7 +602,7 @@ class TestQueueWithdraw:
 
     def test_when_already_withdrawn_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WITHDRAWN])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WITHDRAWN])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -616,8 +616,8 @@ class TestQueueWithdraw:
 class TestQueueShift:
     def test_shift_success(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([2, "4431", "Bob Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         data = main_module.queue_shift(
@@ -650,7 +650,7 @@ class TestQueueShift:
 
     def test_at_end_returns_400(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -666,9 +666,9 @@ class TestQueueShift:
 class TestQueueList:
     def test_list_returns_waiting_rows_for_group(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([2, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_PASSED])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_PASSED])
 
         cookie = _make_student_cookie()
         data = main_module.queue_list(
@@ -683,7 +683,7 @@ class TestQueueList:
 
     def test_without_any_cookie_returns_queue(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
         data = main_module.queue_list(_mock_request(), "dev-course", "4431", "1")
         assert data["size"] == 1
         assert len(data["queue"]) == 1
@@ -711,8 +711,8 @@ class TestQueueList:
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
 
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([2, "4431", "Alice", "ЛР1", "1", STATUS_WAITING])
-        ws.append_row([1, "4431", "Bob", "ЛР1", "1", STATUS_WAITING])
+        ws.append_row([2, "4431", "Alice", "ЛР1", "1", "", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Bob", "ЛР1", "1", "", "", STATUS_WAITING])
 
         data = main_module.queue_list(_mock_request(), "dev-course", "4431", "1")
         assert data["queue_open"] is False
@@ -724,7 +724,7 @@ class TestQueueList:
 class TestQueueSetStatus:
     def test_set_status_success(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
         admin_cookie = _make_admin_cookie()
         data = main_module.queue_set_status(
@@ -746,7 +746,7 @@ class TestQueueSetStatus:
 
     def test_on_non_waiting_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_PASSED])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_PASSED])
 
         admin_cookie = _make_admin_cookie()
         resp = main_module.queue_set_status(
@@ -771,7 +771,7 @@ class TestQueueSetStatus:
 
     def test_invalid_status_returns_400(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
 
         admin_cookie = _make_admin_cookie()
         resp = main_module.queue_set_status(
@@ -796,7 +796,7 @@ class TestQueueSnapshot:
 
     def test_with_past_sheet_moves_rows(self, deps):
         past_ws = FakeWorksheet("Очередь-2026-11-08", [QUEUE_HEADERS])
-        past_ws.append_row([1, "4431", "Past Student", "ЛР1", "", STATUS_WAITING])
+        past_ws.append_row([1, "4431", "Past Student", "ЛР1", "", "", "", STATUS_WAITING])
         past_ws.id = 200
         deps._sheets["Очередь-2026-11-08"] = past_ws
 
@@ -812,7 +812,7 @@ class TestQueueSnapshot:
         rows = history.get_all_values()
         assert len(rows) == 2
         assert rows[1][3] == "Past Student"
-        assert rows[1][6] == STATUS_NOT_REACHED
+        assert rows[1][8] == STATUS_NOT_REACHED
 
 
 class TestQueueErrors:

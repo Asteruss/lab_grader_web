@@ -260,6 +260,8 @@
       "group": "Group",
       "name": "Student",
       "lab": "Lab",
+      "github": "GitHub",
+      "time": "Signed up",
       "status": "Status"
     },
     "errors": {
@@ -298,6 +300,9 @@
     "teamTitle": "Your team",
     "teamMembers": "Members",
     "unnamedEntry": "Student",
+    "githubLabel": "GitHub",
+    "signupTimeLabel": "Signed up",
+    "signupTimeEmpty": "—",
     "statuses": {
       "ждёт": "waiting",
       "сдал": "passed",

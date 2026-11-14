@@ -8,8 +8,27 @@ from grading.schedule import (
     parse_schedule_file,
     parse_course_schedule,
     refresh_all_groups,
+    register_source,
+    ManualScheduleSource,
 )
+from grading.schedule.base import ScheduleSource
 from grading.schedule import guap as guap_module
+
+
+@register_source("review_university_probe")
+class _ReviewUniversityProbe(ScheduleSource):
+    """Registered once at module import to verify the Strategy + Registry
+    contract: a source selected via ``source: <name>`` in the YAML is
+    instantiated by ``parse_course_schedule`` (regression for review defect #7).
+    """
+
+    def __init__(self, course_id, group_id, group_cfg):
+        self.course_id = course_id
+        self.group_id = group_id
+        self.group_cfg = group_cfg
+
+    def list_sessions(self, group_id, since, until):
+        return []
 
 
 def test_guap_fetch_raw_requests_only_the_selected_group_without_cache(monkeypatch):
@@ -508,3 +527,43 @@ groups:
     )
 
     assert parse_schedule_file(schedule_path, "test-course").keys() == {"М433"}
+
+
+def test_parse_course_schedule_uses_registered_source_for_custom_university(tmp_path):
+    """Regression for review defect #7: the factory must honor the
+    Strategy + Registry contract — a source registered via
+    ``@register_source`` and selected via ``source: <name>`` in the YAML
+    is instantiated by ``parse_course_schedule``, not silently replaced
+    with ``ManualScheduleSource``.
+    """
+    cfg = {
+        "course-id": "review",
+        "source": "review_university_probe",
+        "groups": {"G1": {"group_id": "G1", "slots": []}},
+    }
+    path = tmp_path / "review.yaml"
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    sources = parse_course_schedule("review", tmp_path)
+    assert isinstance(sources["G1"], _ReviewUniversityProbe)
+    assert not isinstance(sources["G1"], ManualScheduleSource)
+
+
+def test_parse_course_schedule_keeps_guap_and_manual_working(tmp_path):
+    """The registry fix must not break existing sources: ``manual`` resolves
+    via the registry to ``ManualScheduleSource``, and ``guap`` (a sync source
+    whose slots are materialized at refresh time) still reads via
+    ``ManualScheduleSource`` at runtime.
+    """
+    for source_name, expected_cls in (("manual", ManualScheduleSource),
+                                      ("guap", ManualScheduleSource)):
+        course_id = f"{source_name}-course"
+        cfg = {
+            "course-id": course_id,
+            "source": source_name,
+            "groups": {"G1": {"group_id": "G1", "slots": []}},
+        }
+        path = tmp_path / f"{course_id}.yaml"
+        path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        sources = parse_course_schedule(course_id, tmp_path)
+        assert isinstance(sources["G1"], expected_cls), source_name
