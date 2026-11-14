@@ -24,6 +24,18 @@ import {
   shiftDefenseQueue,
   withdrawFromDefenseQueue,
 } from "../../api";
+import { alpha } from "@mui/material/styles";
+
+const STATUS_CALLED = "вызван";
+
+const STATUS_BG = {
+  "сдал": (theme) => alpha(theme.palette.success.main, 0.1),
+  "не_сдал": (theme) => alpha(theme.palette.error.main, 0.08),
+  "нет": (theme) => alpha(theme.palette.text.primary, 0.06),
+  "отозван": (theme) => alpha(theme.palette.text.primary, 0.06),
+  "не_дошло": (theme) => alpha(theme.palette.text.primary, 0.06),
+  [STATUS_CALLED]: (theme) => alpha(theme.palette.info.main, 0.14),
+};
 
 const normalizeQueue = (data) => {
   if (Array.isArray(data)) return data;
@@ -265,7 +277,11 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
               <Alert severity="success">{t("queue.alreadyPassed")}</Alert>
             )}
 
-            {status && status.in_queue && (
+            {status && status.in_queue && status.called && (
+              <Alert severity="info">{t("queue.calledBanner")}</Alert>
+            )}
+
+            {status && status.in_queue && !status.called && (
               <Alert severity="success">
                 {t("queue.position", {
                   position: status.position,
@@ -296,7 +312,7 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
               </Button>
             )}
 
-            {status && status.in_queue && (
+            {status && status.in_queue && !status.called && (
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems="flex-start">
                 <Button
                   variant="outlined"
@@ -354,16 +370,23 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
               ) : (
                 <List disablePadding>
                   {queue.map((entry, index) => {
-                    const position = entry.position ?? index + 1;
+                    const isCalled = entry.status === STATUS_CALLED;
+                    const position = entry.position ?? (isCalled ? "—" : index + 1);
                     return (
                       <ListItem
                         key={`${entry.fio}-${entry.lab}-${index}`}
                         divider={index < queue.length - 1}
                         disableGutters
+                        sx={
+                          STATUS_BG[entry.status]
+                            ? { bgcolor: STATUS_BG[entry.status] }
+                            : undefined
+                        }
                         secondaryAction={
                           entry.status && (
                             <Chip
                               size="small"
+                              color={isCalled ? "info" : "default"}
                               label={t(`queue.statuses.${entry.status}`, {
                                 defaultValue: entry.status,
                               })}

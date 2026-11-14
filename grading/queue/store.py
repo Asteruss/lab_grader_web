@@ -27,6 +27,7 @@ STATUS_FAILED = "не_сдал"
 STATUS_ABSENT = "нет"
 STATUS_WITHDRAWN = "отозван"
 STATUS_NOT_REACHED = "не_дошло"
+STATUS_CALLED = "вызван"
 
 ACTIVE_STATUSES = {
     STATUS_WAITING,
@@ -332,6 +333,33 @@ def find_waiting(
     return matches[0] if matches else None
 
 
+def find_called(
+    rows: Iterable[QueueRow],
+    group: str,
+    lab: str,
+    fio: str,
+    session_no: int | None = None,
+    github: str = "",
+) -> QueueRow | None:
+    """Called (but not yet finished) entry for *(group, lab, fio)*, if any."""
+    matches = [
+        row
+        for row in rows
+        if row.group == group
+        and row.lab == lab
+        and row.fio == fio
+        and row.status == STATUS_CALLED
+        and (session_no is None or row.session_no == session_no)
+        and _identity_matches(row, github)
+    ]
+    if len(matches) > 1:
+        raise QueueError(
+            "AMBIGUOUS_STUDENT",
+            "Найдено несколько вызванных записей с этим ФИО",
+        )
+    return matches[0] if matches else None
+
+
 def _unique_row(
     rows: Iterable[QueueRow],
     group: str,
@@ -435,19 +463,20 @@ def register(
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
         rows = read_queue_rows(worksheet)
-        # A student has at most one active (waiting) entry per day, across all
-        # labs and sessions: they cannot defend two labs at once. To queue
-        # again they must first resolve the current entry ("сдал" /
+        # A student has at most one active entry per day, across all labs
+        # and sessions: they cannot defend two labs at once. "вызван" counts
+        # as active — the teacher has called them, the defense has not ended.
+        # To queue again they must first resolve the current entry ("сдал" /
         # "не явился" / "отозван"), then they rejoin at the end.
-        already_waiting = [
+        already_active = [
             row
             for row in rows
             if row.group == group
             and row.fio == fio
-            and row.status == STATUS_WAITING
+            and row.status in (STATUS_WAITING, STATUS_CALLED)
             and _identity_matches(row, github)
         ]
-        if already_waiting:
+        if already_active:
             raise QueueError("ALREADY_IN_QUEUE", "Участник уже ожидает")
 
         waiting = list_waiting(rows, group, lab, session_no)
@@ -555,20 +584,111 @@ def set_status(
             for row in rows
             if row.group == group and row.lab == lab and row.fio == fio
         ]
-        waiting = [row for row in matching if row.status == STATUS_WAITING]
-        if not waiting:
+        # A defense result may be set for a waiting entry (called directly
+        # from the sheet) or for a called one (finalizing a defense).
+        active = [
+            row
+            for row in matching
+            if row.status in (STATUS_WAITING, STATUS_CALLED)
+        ]
+        if not active:
             if matching:
                 raise QueueError("NOT_WAITING", "Запись больше не ожидает")
-            raise QueueError("NOT_IN_QUEUE", "Ожидающая запись не найдена")
-        if len(waiting) > 1:
+            raise QueueError("NOT_IN_QUEUE", "Активная запись не найдена")
+        if len(active) > 1:
             raise QueueError(
                 "AMBIGUOUS_STUDENT",
-                "Найдено несколько ожидающих записей с этим ФИО",
+                "Найдено несколько активных записей с этим ФИО",
             )
-        row = waiting[0]
+        row = active[0]
         _write_cells(
             worksheet,
             [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[status]]}],
+        )
+        _renumber_waiting(worksheet, group, lab, session_no)
+
+
+def call_next(
+    spreadsheet,
+    today: date,
+    group: str,
+    lab: str,
+    session_no: int | None = None,
+    group_ids: Iterable[str] = (),
+    fio: str | None = None,
+) -> QueueRow:
+    """Call the first waiting participant, or a specific one by *fio*.
+
+    Parallel calls are allowed: each call marks one waiting entry as
+    "вызван" (its position cell is cleared, so called entries group at
+    the top of the day view) and renumbers the remaining waiting entries
+    1..N, so the next call can happen without finishing the previous
+    defense. The called entry stays visible until a result is set.
+    """
+    with locked_course(spreadsheet.id):
+        worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
+        rows = read_queue_rows(worksheet)
+        waiting = list_waiting(rows, group, lab, session_no)
+        if fio is None:
+            if not waiting:
+                raise QueueError("NO_WAITING", "Нет ожидающих в очереди")
+            row = waiting[0]
+        else:
+            row = _unique_row(waiting, group, lab, fio, session_no)
+        _write_cells(
+            worksheet,
+            [
+                {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_CALLED]]},
+            ],
+        )
+        _renumber_waiting(worksheet, group, lab, session_no)
+        return QueueRow(
+            position=row.position,
+            group=row.group,
+            fio=row.fio,
+            lab=row.lab,
+            session_no=row.session_no,
+            status=STATUS_CALLED,
+            row_index=row.row_index,
+        )
+
+
+def uncall(
+    spreadsheet,
+    today: date,
+    group: str,
+    fio: str,
+    lab: str,
+    session_no: int | None = None,
+    group_ids: Iterable[str] = (),
+) -> None:
+    """Return a called entry back to the waiting queue, at the end."""
+    with locked_course(spreadsheet.id):
+        worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
+        rows = read_queue_rows(worksheet)
+        matching = [
+            row
+            for row in rows
+            if row.group == group and row.lab == lab and row.fio == fio
+        ]
+        called = [row for row in matching if row.status == STATUS_CALLED]
+        if not called:
+            if matching:
+                raise QueueError("NOT_CALLED", "Запись не вызвана")
+            raise QueueError("NOT_IN_QUEUE", "Вызванная запись не найдена")
+        if len(called) > 1:
+            raise QueueError(
+                "AMBIGUOUS_STUDENT",
+                "Найдено несколько вызванных записей с этим ФИО",
+            )
+        row = called[0]
+        waiting = list_waiting(rows, group, lab, session_no)
+        _write_cells(
+            worksheet,
+            [
+                {"range": f"A{row.row_index}", "values": [[len(waiting) + 1]]},
+                {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WAITING]]},
+            ],
         )
         _renumber_waiting(worksheet, group, lab, session_no)
 
@@ -651,7 +771,9 @@ def snapshot_sheet(spreadsheet, sheet_name: str) -> int:
             if seen_counts[key] <= existing_counts.get(key, 0):
                 continue
             final_status = (
-                STATUS_NOT_REACHED if row.status == STATUS_WAITING else row.status
+                STATUS_NOT_REACHED
+                if row.status in (STATUS_WAITING, STATUS_CALLED)
+                else row.status
             )
             new_rows.append(
                 (

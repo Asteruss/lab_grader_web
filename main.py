@@ -104,17 +104,21 @@ from grading.queue.store import (
     STATUS_ABSENT,
     STATUS_WITHDRAWN,
     STATUS_NOT_REACHED,
+    STATUS_CALLED,
     QueueRow,
     ensure_today_sheet,
     ensure_history_sheet,
     read_queue_rows,
     list_waiting,
     find_waiting,
+    find_called,
     find_in_history,
     register as _queue_register,
     withdraw as _queue_withdraw,
     shift_down as _queue_shift_down,
     set_status as _queue_set_status,
+    call_next as _queue_call_next,
+    uncall as _queue_uncall,
     list_today as _queue_list_today,
     find_past_queue_sheets,
     snapshot_sheet,
@@ -3073,6 +3077,10 @@ class QueueSetStatusRequest(BaseModel):
     status: str = Field(...)
 
 
+class QueueCallRequest(BaseModel):
+    identifier: str | None = Field(default=None, min_length=1)
+
+
 # --- OAuth login ---
 
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/login")
@@ -3144,13 +3152,23 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         # Team labs are not resolved in this branch: without an active
         # session we do not make GitHub network calls just for viewing.
         entry = None
+        called_entry = None
         if not is_team_lab(lab_config) and not session_required:
             fio = student.get("fio", "")
-            entry = find_waiting(rows, group_id, lab_short_name, fio) if fio else None
+            if fio:
+                github = student.get("github", "")
+                entry = find_waiting(
+                    rows, group_id, lab_short_name, fio, github=github
+                )
+                if entry is None:
+                    called_entry = find_called(
+                        rows, group_id, lab_short_name, fio, github=github
+                    )
 
         return {
-            "in_queue": entry is not None,
+            "in_queue": entry is not None or called_entry is not None,
             "position": entry.position if entry else None,
+            "called": called_entry is not None,
             "queue_size": len(waiting),
             "ci_status": "unknown",
             "can_register": False,
@@ -3202,6 +3220,10 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     username = student["github"]
     fio_from_cookie = student.get("fio", "")
 
+    # Initialize entry and called_entry to None
+    entry = None
+    called_entry = None
+
     # Resolve identifier (individual or team)
     fio = None
     identifier = None
@@ -3238,15 +3260,15 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "error": e.code,
         }
 
+    github_param = "" if is_team_lab(lab_config) else username
     entry = (
-        find_waiting(
-            rows,
-            group_id,
-            lab_short_name,
-            fio,
-            github="" if is_team_lab(lab_config) else username,
-        )
+        find_waiting(rows, group_id, lab_short_name, fio, github=github_param)
         if fio
+        else None
+    )
+    called_entry = (
+        find_called(rows, group_id, lab_short_name, fio, github=github_param)
+        if entry is None and fio
         else None
     )
 
@@ -3285,14 +3307,16 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     can_register = (
         not already_passed
         and entry is None
+        and called_entry is None
         # Team CI is checked against the shared repo by the registration endpoint.
         and (team_lab or ci_status in ("passed", "not_run"))
         and queue_open
     )
 
     return {
-        "in_queue": entry is not None,
+        "in_queue": entry is not None or called_entry is not None,
         "position": entry.position if entry else None,
+        "called": called_entry is not None,
         "queue_size": len(waiting),
         "ci_status": ci_status,
         "can_register": can_register,
@@ -3534,6 +3558,14 @@ def _read_today_queue_if_exists(spreadsheet, today_str: str):
     return worksheet, read_queue_rows(worksheet)
 
 
+def _view_rank(row) -> int:
+    if row.status == STATUS_CALLED:
+        return 0
+    if row.status == STATUS_WAITING:
+        return 1
+    return 2
+
+
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue")
 @limiter.limit("30/minute")
 def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
@@ -3561,10 +3593,10 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
             r for r in rows
             if r.group == group_id
             and r.lab == lab_short_name
-            and r.status == STATUS_WAITING
             and (session_no is None or r.session_no == session_no)
         ]
-        filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
+        filtered_rows.sort(key=lambda r: (_view_rank(r), r.position or 0, r.row_index))
+        waiting_count = sum(1 for r in filtered_rows if r.status == STATUS_WAITING)
         return {
             "queue": [
                 {
@@ -3574,10 +3606,12 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
                     "lab": r.lab,
                     "session_no": r.session_no,
                     "status": r.status,
+                    "github": r.github,
+                    "signup_time": r.signup_time,
                 }
                 for r in filtered_rows
             ],
-            "size": len(filtered_rows),
+            "size": waiting_count,
             "is_team_lab": is_team_lab(lab_config),
             "queue_open": False,
         }
@@ -3591,17 +3625,17 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
     worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
     rows = read_queue_rows(worksheet)
 
-    # Filter by group_id, lab, status, and session_no
+    # Filter by group_id, lab, and session_no. Called and finished entries
+    # stay visible so students see outcomes (dimmed in UI).
     lab_short_name = lab_config.get("short-name", lab_key)
     filtered_rows = [
         r for r in rows
         if r.group == group_id
         and r.lab == lab_short_name
-        and r.status == STATUS_WAITING
         and (session_no is None or r.session_no == session_no)
     ]
-    # Sort by position
-    filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
+    filtered_rows.sort(key=lambda r: (_view_rank(r), r.position or 0, r.row_index))
+    waiting_count = sum(1 for r in filtered_rows if r.status == STATUS_WAITING)
 
     return {
         "queue": [
@@ -3617,7 +3651,7 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
             }
             for r in filtered_rows
         ],
-        "size": len(filtered_rows),
+        "size": waiting_count,
         "is_team_lab": is_team_lab(lab_config),
         "queue_open": True,
     }
@@ -3703,13 +3737,100 @@ def queue_set_status(
 
     try:
         _queue_set_status(
-            spreadsheet, today, group_id, body.identifier, lab_short_name, body.status, group_ids
+            spreadsheet, today, group_id, body.identifier, lab_short_name,
+            body.status, group_ids=group_ids,
         )
     except QueueError as e:
         return _queue_error_to_response(e)
 
     _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
     return {"status": "updated", "new_status": body.status}
+
+
+# --- Admin: call next / cancel call ---
+
+@app.post("/admin/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/call")
+@limiter.limit("30/minute")
+def queue_call(
+    request: Request,
+    course_id: str,
+    group_id: str,
+    lab_id: str,
+    body: QueueCallRequest | None = None,
+    admin: str = Depends(require_admin),
+):
+    """Call the next waiting participant in the lab's queue.
+
+    Parallel calls are allowed (issue #62, p. 2/4): each call marks one
+    waiting entry as "вызван" without touching previously called ones,
+    so the next call can happen before the previous defense ends.
+    An optional identifier in the body calls that specific participant.
+    """
+    admin = _ensure_admin_resolved(request, admin)
+    course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
+    spreadsheet = _open_spreadsheet(course_info)
+    today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
+
+    lab_short_name = lab_config.get("short-name", lab_key)
+    from datetime import date
+    today = date.fromisoformat(today_str)
+    group_ids = _schedule_group_ids(course_id)
+
+    fio = body.identifier if body is not None and body.identifier else None
+    try:
+        called = _queue_call_next(
+            spreadsheet, today, group_id, lab_short_name,
+            group_ids=group_ids, fio=fio,
+        )
+    except QueueError as e:
+        return _queue_error_to_response(e)
+
+    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    return {
+        "called": {
+            "fio": called.fio,
+            "group": called.group,
+            "lab": called.lab,
+            "status": called.status,
+            "position": called.position,
+        }
+    }
+
+
+@app.post("/admin/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/uncall")
+@limiter.limit("30/minute")
+def queue_uncall(
+    request: Request,
+    course_id: str,
+    group_id: str,
+    lab_id: str,
+    body: QueueCallRequest,
+    admin: str = Depends(require_admin),
+):
+    """Return a called participant back to the waiting queue (at the end)."""
+    admin = _ensure_admin_resolved(request, admin)
+    if body is None or not body.identifier:
+        raise HTTPException(status_code=422, detail="identifier required")
+
+    course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
+    spreadsheet = _open_spreadsheet(course_info)
+    today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
+
+    lab_short_name = lab_config.get("short-name", lab_key)
+    from datetime import date
+    today = date.fromisoformat(today_str)
+    group_ids = _schedule_group_ids(course_id)
+
+    try:
+        _queue_uncall(
+            spreadsheet, today, group_id, body.identifier, lab_short_name,
+            group_ids=group_ids,
+        )
+    except QueueError as e:
+        return _queue_error_to_response(e)
+
+    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    return {"status": "returned"}
 
 
 # --- Admin: manual snapshot ---

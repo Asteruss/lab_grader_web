@@ -269,7 +269,12 @@
       "loadFailed": "Failed to load queue"
     },
     "buttonToday": "Today's queue",
-    "titleToday": "Queue for {{date}}"
+    "titleToday": "Queue for {{date}}",
+    "calledTitle": "Called right now",
+    "callNext": "Call next",
+    "call": "Call",
+    "returnToQueue": "Return to queue",
+    "actions": "Actions"
   },
   "queue": {
     "title": "Defense queue",
@@ -289,6 +294,7 @@
     "registered": "You have joined the queue.",
     "withdraw": "Leave the queue",
     "withdrawn": "You have left the queue.",
+    "calledBanner": "The teacher has called you — get ready for your defense.",
     "shiftBy": "Move back by",
     "shift": "Move back",
     "shifted": "Your queue position has been updated.",
@@ -309,6 +315,7 @@
       "не_сдал": "not passed",
       "нет": "absent",
       "отозван": "withdrew",
+      "вызван": "called",
       "waiting": "waiting",
       "passed": "passed",
       "failed": "not passed",

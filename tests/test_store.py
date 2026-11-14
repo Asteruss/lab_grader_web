@@ -13,6 +13,7 @@ from grading.queue.store import (
     STATUS_PASSED,
     STATUS_WAITING,
     STATUS_WITHDRAWN,
+    STATUS_CALLED,
     ensure_history_sheet,
     ensure_today_sheet,
     find_in_history,
@@ -23,6 +24,8 @@ from grading.queue.store import (
     shift_down,
     snapshot_sheet,
     withdraw,
+    call_next,
+    uncall,
 )
 from grading.queue.locks import reset_locks
 
@@ -233,6 +236,60 @@ def test_snapshot_writes_history_and_deletes_daily_tab_atomically():
     assert append_rows[0]["values"][8]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
     assert append_rows[1]["values"][8]["userEnteredValue"]["stringValue"] == STATUS_FAILED
     assert history.row_values(1) == HISTORY_HEADERS
+
+
+def test_snapshot_maps_called_entry_to_not_reached():
+    spreadsheet = FakeSpreadsheet()
+    active = _add_queue(
+        spreadsheet,
+        [
+            ("4431", "Иванов", "ЛР1", STATUS_CALLED, 1),
+            ("4431", "Петров", "ЛР1", STATUS_WAITING, 2),
+        ],
+    )
+    active.title = "Очередь-2026-11-07"
+    spreadsheet.sheets = {active.title: active}
+    ensure_history_sheet(spreadsheet)
+    spreadsheet.metadata_requests.clear()
+
+    assert snapshot_sheet(spreadsheet, active.title) == 2
+    append_rows = spreadsheet.metadata_requests[0]["appendCells"]["rows"]
+    # И ждущий, и вызванный без результата к концу дня — "не дошёл".
+    assert append_rows[0]["values"][-1]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
+    assert append_rows[1]["values"][-1]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
+
+
+def test_call_next_and_uncall_keep_single_active_entry():
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+    sheet = _add_queue(
+        spreadsheet,
+        [
+            ("4431", "Иванов", "ЛР1", STATUS_WAITING, 1),
+            ("4431", "Петров", "ЛР1", STATUS_WAITING, 2),
+            ("4431", "Сидоров", "ЛР1", STATUS_WAITING, 3),
+        ],
+    )
+
+    called = call_next(spreadsheet, today, "4431", "ЛР1")
+    assert called.fio == "Иванов"
+
+    rows = read_queue_rows(sheet)
+    statuses = {row.fio: (row.position, row.status) for row in rows}
+    assert statuses["Иванов"] == (None, STATUS_CALLED)
+    assert statuses["Петров"] == (1, STATUS_WAITING)
+    assert statuses["Сидоров"] == (2, STATUS_WAITING)
+
+    # Повторная запись вызванным запрещена: одна активная запись на день.
+    with pytest.raises(QueueError, match="ALREADY_IN_QUEUE"):
+        register(spreadsheet, today, "4431", "Иванов", "ЛР1")
+
+    uncall(spreadsheet, today, "4431", "Иванов", "ЛР1")
+    rows = read_queue_rows(sheet)
+    statuses = {row.fio: (row.position, row.status) for row in rows}
+    assert statuses["Иванов"] == (3, STATUS_WAITING)
+    assert statuses["Петров"] == (1, STATUS_WAITING)
+    assert statuses["Сидоров"] == (2, STATUS_WAITING)
 
 
 def test_snapshot_is_idempotent_and_skips_already_moved_rows():
