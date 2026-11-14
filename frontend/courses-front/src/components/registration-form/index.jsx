@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { registerAndCheck, gradeLab } from "../../api";
+import { useState, useEffect } from "react";
+import { registerAndCheck, gradeLab, fetchLabDetails } from "../../api";
 import { CardTitle, colors, MainContainer } from "../../../theme";
 import { Input, InputContainer, RegistrationButton } from "./styled";
 import Snackbar from "@mui/material/Snackbar";
@@ -18,6 +18,23 @@ export const RegistrationForm = ({ courseId, groupId, labId, onBack }) => {
 
   const [checkResult, setCheckResult] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [labDetails, setLabDetails] = useState(null);
+  const [labLoading, setLabLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    fetchLabDetails(courseId, groupId, labId)
+      .then((data) => {
+        if (active) {
+          setLabDetails(data);
+          setLabLoading(false);
+        }
+      })
+      .catch(() => {
+        if (active) setLabLoading(false);
+      });
+    return () => { /* cleanup */ };
+  }, [courseId, groupId, labId]);
 
   const handleChange = (e) => {
     setFormState({ ...formState, [e.target.name]: e.target.value });
@@ -99,7 +116,9 @@ export const RegistrationForm = ({ courseId, groupId, labId, onBack }) => {
     <MainContainer>
       <ButtonBack onClick={onBack}>← Назад</ButtonBack>
       <Breadcrumb courseId={courseId} groupId={groupId} labId={labId} />
-      <CardTitle>Запуск проверки</CardTitle>
+      <CardTitle>
+        {labDetails?.name || labDetails?.["short-name"] || labId}
+      </CardTitle>
       <InputContainer>
         <Input
           type="text"

@@ -435,15 +435,14 @@ def register(
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
         rows = read_queue_rows(worksheet)
-        # Duplicate check ignores session_no: a student cannot be waiting
-        # twice for the same lab on the same day, even across sessions.
-        # GitHub is part of the identity (#15): students sharing a FIO
-        # hold separate entries.
+        # A student has at most one active (waiting) entry per day, across all
+        # labs and sessions: they cannot defend two labs at once. To queue
+        # again they must first resolve the current entry ("сдал" /
+        # "не явился" / "отозван"), then they rejoin at the end.
         already_waiting = [
             row
             for row in rows
             if row.group == group
-            and row.lab == lab
             and row.fio == fio
             and row.status == STATUS_WAITING
             and _identity_matches(row, github)
