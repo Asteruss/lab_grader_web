@@ -15,7 +15,6 @@ import {
   Select,
   Stack,
   Tab,
-  TabList as MuiTabList,
   Table,
   TableBody,
   TableCell,
