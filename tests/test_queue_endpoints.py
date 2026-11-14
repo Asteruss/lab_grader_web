@@ -373,7 +373,7 @@ class TestQueueStatus:
 
     def test_status_shows_called_entry(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_CALLED])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_CALLED])
 
         cookie = _make_student_cookie()
         data = main_module.queue_status(
@@ -428,7 +428,7 @@ class TestQueueRegister:
         # "вызван" — тоже активная запись: пока защита не завершена,
         # повторная регистрация запрещена (та же продукт-инварианта).
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", STATUS_CALLED])
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_CALLED])
 
         cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
@@ -705,10 +705,13 @@ class TestQueueList:
             _mock_request({"student_session": cookie}),
             "dev-course", "4431", "1",
         )
-        # Only WAITING status rows for group 4431 are returned
+        # Waiting rows plus finished ones (kept visible, dimmed in UI);
+        # "size" counts only the waiting queue.
         assert data["size"] == 2
-        assert len(data["queue"]) == 2
-        assert all(r["status"] == STATUS_WAITING for r in data["queue"])
+        assert len(data["queue"]) == 3
+        assert [r["status"] for r in data["queue"]] == [
+            STATUS_WAITING, STATUS_WAITING, STATUS_PASSED,
+        ]
         assert all(r["group"] == "4431" for r in data["queue"])
 
     def test_without_any_cookie_returns_queue(self, deps):
@@ -816,7 +819,7 @@ class TestQueueSetStatus:
     def test_finalize_called_entry(self, deps):
         # Завершение защиты вызванного участника — основной сценарий вызова.
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_CALLED])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_CALLED])
 
         admin_cookie = _make_admin_cookie()
         data = main_module.queue_set_status(
@@ -826,14 +829,14 @@ class TestQueueSetStatus:
             admin="admin",
         )
         assert data["new_status"] == "сдал"
-        assert deps.worksheet("Очередь-" + TODAY_STR).get_all_values()[1][5] == "сдал"
+        assert deps.worksheet("Очередь-" + TODAY_STR).get_all_values()[1][7] == "сдал"
 
 
 class TestQueueCall:
     def test_call_next_marks_first_waiting_and_renumbers(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([2, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
 
         admin_cookie = _make_admin_cookie()
         data = main_module.queue_call(
@@ -846,18 +849,18 @@ class TestQueueCall:
         assert data["called"]["status"] == STATUS_CALLED
 
         rows = ws.get_all_values()
-        assert rows[1][5] == STATUS_CALLED
-        assert rows[1][0] == ""  # позиция вызванного очищается
-        assert rows[2][5] == STATUS_WAITING
+        assert rows[1][7] == STATUS_CALLED
+        assert rows[1][0] == "1"  # позиция НЕ очищается — остаётся 1
+        assert rows[2][7] == STATUS_WAITING
         assert rows[2][0] == "1"  # оставшиеся ждущие перенумерованы
 
     def test_parallel_calls_without_finishing_previous(self, deps):
         # Сценарий ревью: вызвать первого, не завершая его защиту,
         # вызвать второго — оба сохраняются как текущее состояние.
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([2, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([3, "4431", "Carol", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([3, "4431", "Carol", "ЛР1", "", "", "", STATUS_WAITING])
 
         admin_cookie = _make_admin_cookie()
         req = _mock_request({"admin_session": admin_cookie})
@@ -871,15 +874,15 @@ class TestQueueCall:
         assert second["called"]["fio"] == "Bob"
 
         rows = ws.get_all_values()
-        assert [rows[i][5] for i in (1, 2, 3)] == [
+        assert [rows[i][7] for i in (1, 2, 3)] == [
             STATUS_CALLED, STATUS_CALLED, STATUS_WAITING,
         ]
         assert rows[3][0] == "1"  # Carol стала первой ждущей
 
     def test_call_specific_participant_by_identifier(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([2, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
 
         admin_cookie = _make_admin_cookie()
         data = main_module.queue_call(
@@ -891,9 +894,9 @@ class TestQueueCall:
         assert data["called"]["fio"] == "Bob"
 
         rows = ws.get_all_values()
-        assert rows[1][5] == STATUS_WAITING
+        assert rows[1][7] == STATUS_WAITING
         assert rows[1][0] == "1"  # Alice перенумерована на первую позицию
-        assert rows[2][5] == STATUS_CALLED
+        assert rows[2][7] == STATUS_CALLED
 
     def test_empty_queue_returns_409(self, deps):
         admin_cookie = _make_admin_cookie()
@@ -917,8 +920,8 @@ class TestQueueCall:
 
     def test_uncall_returns_entry_to_end_of_queue(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
-        ws.append_row([1, "4431", "Alice", "ЛР1", "", STATUS_WAITING])
-        ws.append_row([2, "4431", "Bob", "ЛР1", "", STATUS_WAITING])
+        ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
 
         admin_cookie = _make_admin_cookie()
         req = _mock_request({"admin_session": admin_cookie})
@@ -934,9 +937,9 @@ class TestQueueCall:
 
         rows = ws.get_all_values()
         # Bob остаётся первым (позиция 1), Alice возвращается в конец (позиция 2).
-        assert rows[1][5] == STATUS_WAITING
+        assert rows[1][7] == STATUS_WAITING
         assert rows[1][0] == "2"
-        assert rows[2][5] == STATUS_WAITING
+        assert rows[2][7] == STATUS_WAITING
         assert rows[2][0] == "1"
 
     def test_uncall_not_called_returns_409(self, deps):

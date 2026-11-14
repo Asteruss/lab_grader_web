@@ -276,7 +276,8 @@ def test_call_next_and_uncall_keep_single_active_entry():
 
     rows = read_queue_rows(sheet)
     statuses = {row.fio: (row.position, row.status) for row in rows}
-    assert statuses["Иванов"] == (None, STATUS_CALLED)
+    # Вызванный сохраняет свою позицию (не None)
+    assert statuses["Иванов"] == (1, STATUS_CALLED)
     assert statuses["Петров"] == (1, STATUS_WAITING)
     assert statuses["Сидоров"] == (2, STATUS_WAITING)
 
