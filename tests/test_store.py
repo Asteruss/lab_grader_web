@@ -114,14 +114,14 @@ def reset_state():
 def _add_queue(spreadsheet, entries, title="Очередь-2026-11-08"):
     """Create a queue sheet pre-filled with rows.
 
-    Each entry is ``(group, fio, lab, status, position)``; Пар№ is left
-    empty so that the 6-column layout matches QUEUE_HEADERS.
+    Each entry is ``(group, fio, lab, status, position)``; Пар№, GitHub and
+    Время are left empty so that the 8-column layout matches QUEUE_HEADERS.
     """
     sheet = FakeWorksheet(title, spreadsheet.next_id, [QUEUE_HEADERS])
     spreadsheet.next_id += 1
     spreadsheet.sheets[sheet.title] = sheet
     for group, fio, lab, status, position in entries:
-        sheet.append_row([position, group, fio, lab, "", status])
+        sheet.append_row([position, group, fio, lab, "", "", "", status])
     return sheet
 
 
@@ -140,14 +140,14 @@ def test_ensure_sheets_uses_exact_headers_and_protects_data():
 def test_register_appends_waiting_row_and_blocks_duplicate_waiting_fio():
     spreadsheet = FakeSpreadsheet()
 
-    assert register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1") == 1
+    assert register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1", github="ivanov", signup_time="10:30") == 1
     assert register(spreadsheet, date(2026, 11, 8), "4431", "Петров Пётр", "ЛР1") == 2
     with pytest.raises(QueueError, match="ALREADY_IN_QUEUE"):
         register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1")
 
     sheet = spreadsheet.sheets["Очередь-2026-11-08"]
     assert sheet.row_values(1) == QUEUE_HEADERS
-    assert sheet.row_values(2) == ["1", "4431", "Иванов Иван", "ЛР1", "", STATUS_WAITING]
+    assert sheet.row_values(2) == ["1", "4431", "Иванов Иван", "ЛР1", "", "ivanov", "10:30", STATUS_WAITING]
 
 
 def test_shift_down_only_for_waiting_entries_and_clamps_at_end():
@@ -230,8 +230,8 @@ def test_snapshot_writes_history_and_deletes_daily_tab_atomically():
     assert "deleteSheet" in requests[1]
     assert active.title not in spreadsheet.sheets
     append_rows = requests[0]["appendCells"]["rows"]
-    assert append_rows[0]["values"][-1]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
-    assert append_rows[1]["values"][-1]["userEnteredValue"]["stringValue"] == STATUS_FAILED
+    assert append_rows[0]["values"][8]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
+    assert append_rows[1]["values"][8]["userEnteredValue"]["stringValue"] == STATUS_FAILED
     assert history.row_values(1) == HISTORY_HEADERS
 
 
@@ -278,7 +278,7 @@ def test_snapshot_preserves_repeated_registrations_and_is_idempotent():
 
     assert snapshot_sheet(spreadsheet, "Очередь-2026-11-07") == 2
     assert [
-        row[6] for row in history.get_all_values()[1:]
+        row[8] for row in history.get_all_values()[1:]
     ] == [STATUS_WITHDRAWN, STATUS_NOT_REACHED]
 
     _add_queue(
@@ -323,11 +323,63 @@ def test_snapshot_ignores_non_queue_tabs_and_future_dates():
 def test_find_in_history_checks_correct_columns():
     spreadsheet = FakeSpreadsheet()
     history = FakeWorksheet(HISTORY_SHEET := "История_очереди", 1, [HISTORY_HEADERS])
-    history.append_row(["2026-11-07", "1", "4431", "Иванов", "ЛР1", "", STATUS_PASSED])
-    history.append_row(["2026-11-07", "2", "4431", "Петров", "ЛР1", "", STATUS_FAILED])
+    history.append_row(["2026-11-07", "1", "4431", "Иванов", "ЛР1", "", "", "", STATUS_PASSED])
+    history.append_row(["2026-11-07", "2", "4431", "Петров", "ЛР1", "", "", "", STATUS_FAILED])
     spreadsheet.sheets[HISTORY_SHEET] = history
 
     assert find_in_history(history, "4431", "Иванов", "ЛР1", STATUS_PASSED) is True
     assert find_in_history(history, "4431", "Иванов", "ЛР1", STATUS_FAILED) is False
     assert find_in_history(history, "4431", "Петров", "ЛР1", STATUS_FAILED) is True
     assert find_in_history(history, "4432", "Иванов", "ЛР1", STATUS_PASSED) is False
+
+
+def test_withdraw_and_shift_match_by_github_not_fio_for_same_name_students():
+    """#15: two students sharing a FIO but not a GitHub login hold separate
+    entries; neither may touch the other's row."""
+    spreadsheet = FakeSpreadsheet()
+
+    register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+             github="c06-ivanov-a", signup_time="10:00")
+    sheet = spreadsheet.sheets["Очередь-2026-11-08"]
+
+    # Same FIO, different GitHub login: withdraw and shift must NOT match A's row.
+    with pytest.raises(QueueError, match="NOT_IN_QUEUE"):
+        withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+                 github="c06-ivanov-b")
+    with pytest.raises(QueueError, match="NOT_IN_QUEUE"):
+        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1", 1,
+                   github="c06-ivanov-b")
+
+    # A different FIO still matches only its own row (control).
+    register(spreadsheet, date(2026, 11, 8), "4431", "Петрова Анна", "ЛР1",
+             github="c06-petrova", signup_time="10:05")
+    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Петрова Анна", "ЛР1",
+             github="c06-petrova")
+
+    rows = read_queue_rows(sheet)
+    ivanov = [row for row in rows if row.fio == "Иванов Иван"][0]
+    assert ivanov.status == STATUS_WAITING
+    assert ivanov.github == "c06-ivanov-a"
+    petrova = [row for row in rows if row.fio == "Петрова Анна"][0]
+    assert petrova.status == STATUS_WITHDRAWN
+
+    # The owner can still withdraw their own entry (github match).
+    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+             github="c06-ivanov-a")
+    rows = read_queue_rows(sheet)
+    ivanov = [row for row in rows if row.fio == "Иванов Иван"][0]
+    assert ivanov.status == STATUS_WITHDRAWN
+
+
+def test_register_same_fio_different_github_are_separate_entries():
+    """#15: duplicate check is keyed by (fio, github) — two students with the
+    same FIO can both wait, while the same login cannot register twice."""
+    spreadsheet = FakeSpreadsheet()
+
+    assert register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+                    github="c06-ivanov-a") == 1
+    assert register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+                    github="c06-ivanov-b") == 2
+    with pytest.raises(QueueError, match="ALREADY_IN_QUEUE"):
+        register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+                 github="c06-ivanov-a")

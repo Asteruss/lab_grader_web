@@ -34,5 +34,7 @@ class QueueError(Exception):
     def __init__(self, code: str, message: str = ""):
         self.code = code
         self.message = message
-        self.http_status = _STATUS_MAP.get(code, 500)  # plain attribute
+        # Use the complete map: the truncated legacy map silently turned
+        # CI_CHECK_FAILED / SHEETS_UNAVAILABLE / NOT_IN_GROUP into 500s.
+        self.http_status = ERROR_HTTP_STATUS.get(code, 500)  # plain attribute
         super().__init__(f"{code}: {message}")

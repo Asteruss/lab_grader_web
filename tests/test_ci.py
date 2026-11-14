@@ -35,12 +35,12 @@ def test_non_passing_grade_formats(value):
     assert not ci.is_passing_grade(value)
 
 
-def test_ensure_ci_passed_uses_shared_evaluator_and_writes_updated_grade(
+def test_ensure_ci_passed_updated_passing_returns_without_writing_grade_cell(
     monkeypatch, queue_context
 ):
     context, writes = queue_context
     outcome = StudentOutcome(
-        status="updated", cell_value="v@8,5", message="passed", passed=True
+        status="updated", cell_value="v@8,5", message="passed", ci_passed=True, passed="CI пройден"
     )
     calls = {}
 
@@ -63,11 +63,11 @@ def test_ensure_ci_passed_uses_shared_evaluator_and_writes_updated_grade(
 
     assert returned_context is context
     assert returned_outcome is outcome
-    assert writes == [(4, 3, "v@8,5")]
+    assert writes == []
     assert calls["kwargs"]["repo_name"] == "team-repo"
 
 
-def test_ensure_ci_passed_writes_failed_grade_like_grade_endpoint(
+def test_ensure_ci_passed_failed_ci_writes_nothing_to_grade_cell(
     monkeypatch, queue_context
 ):
     context, writes = queue_context
@@ -75,7 +75,7 @@ def test_ensure_ci_passed_writes_failed_grade_like_grade_endpoint(
         ci,
         "evaluate_student",
         lambda *_args, **_kwargs: StudentOutcome(
-            status="updated", cell_value="x", message="failed", passed=False
+            status="updated", cell_value="x", message="failed", ci_passed=False
         ),
     )
 
@@ -83,7 +83,40 @@ def test_ensure_ci_passed_writes_failed_grade_like_grade_endpoint(
         ci.ensure_ci_passed(
             object(), "org", "student", {}, {}, lambda: context
         )
-    assert writes == [(4, 3, "x")]
+    assert writes == []
+
+
+def test_ensure_ci_passed_never_modifies_existing_grade_cell(
+    monkeypatch, queue_context
+):
+    """Regression for review defect #2: queue registration must not touch the
+    teacher's evaluation cell — even when CI passes and ``/grade`` would have
+    written ``v``. The reviewer's repro: cell contains ``?``, CI green,
+    POST /queue/register → the cell must stay ``?``.
+    """
+    context, writes = queue_context
+    context_with_question_mark = QueueSheetContext(
+        spreadsheet=context.spreadsheet,
+        worksheet=context.worksheet,
+        grade_context=context.grade_context,
+        row_index=context.row_index,
+        lab_column=context.lab_column,
+        fio=context.fio,
+        current_cell_value="?",
+    )
+    monkeypatch.setattr(
+        ci,
+        "evaluate_student",
+        lambda *_args, **_kwargs: StudentOutcome(
+            status="updated", cell_value="v", message="CI пройден", ci_passed=True
+        ),
+    )
+
+    returned_context, returned_outcome = ci.ensure_ci_passed(
+        object(), "org", "student", {}, {}, lambda: context_with_question_mark
+    )
+    assert returned_outcome.ci_passed is True
+    assert writes == []
 
 
 def test_ensure_ci_passed_does_not_write_pending_or_error(monkeypatch, queue_context):
@@ -93,7 +126,7 @@ def test_ensure_ci_passed_does_not_write_pending_or_error(monkeypatch, queue_con
             ci,
             "evaluate_student",
             lambda *_args, _status=status, **_kwargs: StudentOutcome(
-                status=_status, cell_value=None, message=_status, passed=False
+                status=_status, cell_value=None, message=_status, ci_passed=False
             ),
         )
         with pytest.raises(QueueError, match=code):
@@ -106,20 +139,20 @@ def test_ensure_ci_passed_does_not_write_pending_or_error(monkeypatch, queue_con
 def test_ensure_ci_passed_rejected_with_passed_allows_registration(
     monkeypatch, queue_context
 ):
-    """A rejected outcome (cell protected) with passed=True should not block."""
+    """A rejected outcome (cell protected) with ci_passed=True should not block."""
     context, writes = queue_context
     monkeypatch.setattr(
         ci,
         "evaluate_student",
         lambda *_args, **_kwargs: StudentOutcome(
-            status="rejected", cell_value="v", message="cell protected", passed=True
+            status="rejected", cell_value="v", message="cell protected", ci_passed=True
         ),
     )
 
     returned_context, returned_outcome = ci.ensure_ci_passed(
         object(), "org", "student", {}, {}, lambda: context
     )
-    assert returned_outcome.passed is True
+    assert returned_outcome.ci_passed is True
     assert writes == []
 
 
@@ -131,7 +164,7 @@ def test_ensure_ci_passed_rejected_without_passed_raises_ci_not_passed(
         ci,
         "evaluate_student",
         lambda *_args, **_kwargs: StudentOutcome(
-            status="rejected", cell_value="v", message="CI failed", passed=False
+            status="rejected", cell_value="v", message="CI failed", ci_passed=False
         ),
     )
 
@@ -158,3 +191,30 @@ def test_ensure_ci_passed_blocks_when_cell_has_vv(queue_context):
         ci.ensure_ci_passed(
             object(), "org", "student", {}, {}, lambda: context_with_vv
         )
+
+
+def test_ensure_ci_passed_rejected_with_truthy_passed_string_but_ci_passed_false_blocks(
+    monkeypatch, queue_context
+):
+    """Regression for review defect #1: ``StudentOutcome.passed`` is a summary
+    string (e.g. "0/4 тестов пройдено"), not a bool. A failed CI may still
+    produce a non-empty (truthy) string; the verdict must come from
+    ``ci_passed`` (bool), not from truthiness of ``passed``.
+    """
+    context, writes = queue_context
+    monkeypatch.setattr(
+        ci,
+        "evaluate_student",
+        lambda *_args, **_kwargs: StudentOutcome(
+            status="rejected",
+            cell_value="v",
+            message="cell protected",
+            passed="0/4 тестов пройдено",  # truthy string, but CI failed
+            ci_passed=False,
+        ),
+    )
+    with pytest.raises(QueueError, match="CI_NOT_PASSED"):
+        ci.ensure_ci_passed(
+            object(), "org", "student", {}, {}, lambda: context
+        )
+    assert writes == []

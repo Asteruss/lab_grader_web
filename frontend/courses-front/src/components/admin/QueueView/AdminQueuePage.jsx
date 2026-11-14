@@ -124,6 +124,8 @@ export const AdminQueuePage = () => {
               <TableCell>{t("adminQueue.columns.group")}</TableCell>
               <TableCell>{t("adminQueue.columns.name")}</TableCell>
               <TableCell>{t("adminQueue.columns.lab")}</TableCell>
+              <TableCell>{t("adminQueue.columns.github")}</TableCell>
+              <TableCell>{t("adminQueue.columns.time")}</TableCell>
               <TableCell>{t("adminQueue.columns.status")}</TableCell>
             </TableRow>
           </TableHead>
@@ -134,6 +136,8 @@ export const AdminQueuePage = () => {
                 <TableCell>{entry.group}</TableCell>
                 <TableCell>{entry.fio}</TableCell>
                 <TableCell>{entry.lab}</TableCell>
+                <TableCell>{entry.github || "—"}</TableCell>
+                <TableCell>{entry.signup_time || "—"}</TableCell>
                 <TableCell>
                   <Chip
                     size="small"
