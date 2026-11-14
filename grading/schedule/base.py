@@ -49,6 +49,11 @@ class ScheduledSession:
       - None  → all labs of the course are allowed (slot's `labs` was null/absent)
       - []    → slot is closed for queue (slot's `labs` was an empty list)
       - [...] → only these lab ids may be defended in this slot
+
+    `removed_lab_ids` complements the None case: when a partial correction
+    removes specific labs from an "all labs" slot, the slot stays None
+    (all) minus these exclusions — no need for queue_settings.all_lab_ids
+    (review defect #13).
     """
     course_id: str
     group_id: str
@@ -60,10 +65,22 @@ class ScheduledSession:
     source: str = 'manual'
     slot_id: str | None = None
     allowed_lab_ids: list[str] | None = None
+    removed_lab_ids: list[str] | None = None
     room: str | None = None
     teacher: str | None = None
     note: str | None = None
     raw: dict = field(default_factory=dict)   # for debugging / ADR
+
+    def allows_lab(self, lab_key: str) -> bool:
+        """Whether this session permits defending `lab_key`.
+
+        Combines both exclusion dimensions: the explicit allowlist
+        (`allowed_lab_ids`, None = all) and labs removed by partial
+        corrections (`removed_lab_ids`).
+        """
+        if self.allowed_lab_ids is not None and lab_key not in self.allowed_lab_ids:
+            return False
+        return not self.removed_lab_ids or lab_key not in self.removed_lab_ids
 
 
 class ScheduleSource(ABC):

@@ -337,6 +337,7 @@ class ManualScheduleSource(ScheduleSource):
                     source=self._source_name,
                     slot_id=s.get('id'),
                     allowed_lab_ids=_resolve_labs(s.get('labs')),
+                    removed_lab_ids=s.get('removed_labs'),
                     room=s.get('room'),
                     teacher=s.get('teacher'),
                     note=s.get('note'),
@@ -363,7 +364,8 @@ class ManualScheduleSource(ScheduleSource):
                 s_copy = dict(s)
                 # If labs is null (all) and a correction might want to remove
                 # a specific lab, we materialize the list now using all_lab_ids.
-                # Otherwise leave None to mean "all labs".
+                # Otherwise leave None to mean "all labs"; partial corrections
+                # are then recorded as removed_labs exclusions (defect #13).
                 if s_copy.get('labs') is None and all_labs is not None:
                     s_copy['labs'] = list(all_labs)
                 result.append(s_copy)
@@ -389,9 +391,17 @@ class ManualScheduleSource(ScheduleSource):
                         if s.get('id') == slot_id:
                             current = s.get('labs')
                             if current is None:
-                                # Shouldn't happen — we materialized above.
-                                continue
-                            s['labs'] = [x for x in current if x not in labs_to_remove]
+                                # The slot allows all labs and the course did
+                                # not declare queue_settings.all_lab_ids, so
+                                # there is no full list to subtract from.
+                                # Record the exclusion instead (review defect
+                                # #13): the slot stays "all labs" minus these
+                                # labs via ScheduledSession.removed_lab_ids.
+                                excluded = set(s.get('removed_labs') or ())
+                                excluded.update(labs_to_remove)
+                                s['removed_labs'] = sorted(excluded)
+                            else:
+                                s['labs'] = [x for x in current if x not in labs_to_remove]
 
             # 2b. Add new slots for this date.
             for add in c.get('add_slots', []) or []:

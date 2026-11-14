@@ -2765,6 +2765,7 @@ def schedule_sessions(
                 "teacher": s.teacher,
                 "note": s.note,
                 "allowed_lab_ids": s.allowed_lab_ids,  # None=all, []=closed, [...] = only these
+                "removed_lab_ids": s.removed_lab_ids,  # labs excluded by partial corrections
             }
             for s in sessions
         ],

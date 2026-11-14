@@ -162,10 +162,7 @@ def active_session_for(
         session
         for session in sessions
         if session.auto_open_at <= context.now <= session.auto_close_at
-        and (
-            session.allowed_lab_ids is None
-            or lab_key in session.allowed_lab_ids
-        )
+        and session.allows_lab(lab_key)
     ]
     return min(active, key=lambda session: session.starts_at) if active else None
 
@@ -195,10 +192,7 @@ def next_session_for(
         session
         for session in sessions
         if session.starts_at > context.now
-        and (
-            session.allowed_lab_ids is None
-            or lab_key in session.allowed_lab_ids
-        )
+        and session.allows_lab(lab_key)
     ]
     return min(upcoming, key=lambda session: session.starts_at) if upcoming else None
 
