@@ -230,68 +230,26 @@ def _setup_new_sheet(
             }
         })
 
-    spreadsheet.batch_update({"requests": requests})
-
     if queue:
-        # Лист как «Таблица» Google Sheets (задача #19, п.4): таблица сама
-        # даёт сортировку/фильтр по значениям колонок (п.3а). Диапазон на
-        # все 200 строк: register пишет строки range-update'ом (НЕ
-        # values.append) ВНУТРИ декларированного диапазона — таблица
-        # покрывает их. values.append при пересечении с таблицей ставил
-        # строку «после последней строки таблицы» (был баг: запись вставала
-        # на строку 201, вне таблицы и без её фильтров).
-        #
-        # Таблица и базовый автофильтр не сосуществуют на одном диапазоне
-        # (Sheets API 400), поэтому автофильтр — фолбэк, когда Tables
-        # недоступны у аккаунта.
-        table_request = {
-            "addTable": {
-                "table": {
-                    # имена таблиц не допускают спецсимволов (дефисов) —
-                    # заменяем на подчёркивания: «Очередь_2026_11_15»
-                    "name": worksheet.title.replace("-", "_"),
+        # Автофильтр по заголовкам (задача #19, п.3а): сортировка кликом и
+        # фильтр по значениям, которые реально есть в колонке. Диапазон до
+        # QUEUE_SHEET_ROWS. НЕ values.append-friendly проблем: записи
+        # пишутся range-update'ом по вычисленному row_index.
+        requests.append({
+            "setBasicFilter": {
+                "filter": {
                     "range": {
                         "sheetId": worksheet.id,
                         "startRowIndex": 0,
                         "endRowIndex": QUEUE_SHEET_ROWS,
                         "startColumnIndex": 0,
                         "endColumnIndex": len(QUEUE_HEADERS),
-                    },
-                    "columnProperties": [
-                        {"columnIndex": index, "columnName": header}
-                        for index, header in enumerate(QUEUE_HEADERS)
-                    ],
+                    }
                 }
             }
-        }
-        try:
-            spreadsheet.batch_update({"requests": [table_request]})
-        except Exception as error:
-            logger.warning(
-                "addTable for %s failed, falling back to basic filter: %s",
-                worksheet.title,
-                error,
-            )
-            try:
-                spreadsheet.batch_update({"requests": [{
-                    "setBasicFilter": {
-                        "filter": {
-                            "range": {
-                                "sheetId": worksheet.id,
-                                "startRowIndex": 0,
-                                "endRowIndex": QUEUE_SHEET_ROWS,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": len(QUEUE_HEADERS),
-                            }
-                        }
-                    }
-                }]})
-            except Exception as filter_error:
-                logger.warning(
-                    "setBasicFilter fallback for %s also failed: %s",
-                    worksheet.title,
-                    filter_error,
-                )
+        })
+
+    spreadsheet.batch_update({"requests": requests})
 
 
 # Кэш worksheet-объектов + валидации заголовков (план оптимизации, П.8/П.9).
