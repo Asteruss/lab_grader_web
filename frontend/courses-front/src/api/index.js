@@ -49,9 +49,11 @@ export const getQueueLoginUrl = (courseId, groupId, labId) =>
   `${API_BASE_URL}/courses/${encodeURIComponent(courseId)}/groups/${encodeURIComponent(groupId)}/labs/${encodeURIComponent(labId)}/queue/login`;
 
 const requestDefenseQueue = async (url, options = {}) => {
+  // OAuth plan §1/§4: очередь работает без cookies — identity приходит
+  // в теле запроса (GitHub OAuth code), credentials не нужны.
   let response;
   try {
-    response = await fetch(url, { credentials: "include", ...options });
+    response = await fetch(url, options);
   } catch (cause) {
     const error = new Error("Queue request failed", { cause });
     error.code = "unknown";
@@ -85,21 +87,9 @@ const requestDefenseQueue = async (url, options = {}) => {
   return data;
 };
 
-export const fetchDefenseQueueStatus = (courseId, groupId, labId, sessionNo) => {
-  const url = new URL(`${defenseQueueUrl(courseId, groupId, labId)}/status`);
-  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
-  return requestDefenseQueue(url.toString());
-};
-
-export const fetchDefenseQueue = (courseId, groupId, labId, sessionNo) => {
-  const url = new URL(defenseQueueUrl(courseId, groupId, labId));
-  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
-  return requestDefenseQueue(url.toString());
-};
-
 export const fetchLabDetails = async (courseId, groupId, labId) => {
   const url = `${API_BASE_URL}/courses/${encodeURIComponent(courseId)}/groups/${encodeURIComponent(groupId)}/labs/${encodeURIComponent(labId)}`;
-  const response = await fetch(url, { credentials: "include" });
+  const response = await fetch(url);
   if (!response.ok) {
     const error = new Error("Failed to fetch lab details");
     error.status = response.status;
@@ -108,32 +98,63 @@ export const fetchLabDetails = async (courseId, groupId, labId) => {
   return response.json();
 };
 
+
+// --- Очередь через GitHub OAuth (PLAN_queue_oauth.md §3/§4) ----------------
+//
+// Identity per-request: фронт получает OAuth code (redirect back с
+// ?queue_code=...), POST'ит его в теле мутации вместе с ФИО/группой;
+// сервер обменивает код на подтверждённый username и сверяет с таблицей.
+// Никаких cookies и сессий.
+
+export const getQueueOAuthStartUrl = (courseId, groupId, labId) =>
+  `${defenseQueueUrl(courseId, groupId, labId)}/oauth/start`;
+
+export const fetchDefenseQueue = (courseId, groupId, labId, { studentName, studentGroup } = {}) => {
+  const url = new URL(defenseQueueUrl(courseId, groupId, labId));
+  if (studentName) url.searchParams.set("student_name", studentName);
+  if (studentGroup) url.searchParams.set("student_group", studentGroup);
+  return requestDefenseQueue(url.toString());
+};
+
+export const registerInQueue = ({ courseId, groupId, labId, code, studentName, studentGroup }) =>
+  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      student_name: studentName,
+      student_group: studentGroup,
+    }),
+  });
+
+export const withdrawFromQueue = ({ courseId, groupId, labId, code, studentName, studentGroup }) =>
+  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/withdraw`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      student_name: studentName,
+      student_group: studentGroup,
+    }),
+  });
+
+export const shiftInQueue = ({ courseId, groupId, labId, code, studentName, studentGroup, delta }) =>
+  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/shift`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      student_name: studentName,
+      student_group: studentGroup,
+      delta,
+    }),
+  });
+
 export const extractSessionNo = (session) => {
   if (!session?.slot_id) return null;
   const digits = session.slot_id.match(/\d+/g);
   return digits ? parseInt(digits[digits.length - 1], 10) : null;
 };
-
-export const registerForDefenseQueue = (courseId, groupId, labId) =>
-  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/register`, {
-    method: "POST",
-  });
-
-export const withdrawFromDefenseQueue = (courseId, groupId, labId) =>
-  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/withdraw`, {
-    method: "POST",
-  });
-
-export const shiftDefenseQueue = (courseId, groupId, labId, delta, sessionNo) => {
-  const url = new URL(`${defenseQueueUrl(courseId, groupId, labId)}/shift`);
-  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
-  return requestDefenseQueue(url.toString(), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ delta }),
-  });
-};
-
 
 // --- Ручное открытие / досрочное закрытие записи (issue #10) ----------------
 //
@@ -145,7 +166,6 @@ export const shiftDefenseQueue = (courseId, groupId, labId, delta, sessionNo) =>
 // В отличие от студенческих queue-функций выше, эти идут через dev-прокси
 // /api/v1 (vite.config.js rewrite -> /admin на backend), same-origin, чтобы
 // admin-cookie уходил без CORS-обёртки — так же, как AdminQueuePage шлёт свои
-// call/uncall/set-status. requestDefenseQueue уже ставит credentials:"include"
 // и вытаскивает стабильные коды ошибок (SESSION_REQUIRED и т.п.).
 
 const adminQueueOverrideUrl = (courseId, groupId, action) =>
@@ -216,10 +236,9 @@ export const getSecretJoinStartUrl = (token) =>
 
 // --- Командные лабораторные работы (docs/TEAM_ASSIGNMENTS_PLAN.md §8.2) ---
 //
-// Все три запроса идут с credentials: "include" - личность студента backend
-// берёт из подписанной cookie join_session, и только из неё. В dev-режиме
-// фронтенд на :8080 и backend на :8000 - это разные источники, поэтому без
-// этой опции cookie не уедет (так же сделано в админке, LabList/index.jsx).
+// Командные лабораторные: личность студента backend берёт из подписанной
+// cookie join_session (единственное место, где cookie ещё используется —
+// командный flow вне плана OAuth).
 
 const joinTeamsUrl = (courseId, labId) =>
   `${API_BASE_URL}/join/${encodeURIComponent(courseId)}/${encodeURIComponent(labId)}/teams`;
@@ -386,7 +405,6 @@ export const registerAndCheck = async (courseId, groupId, formData) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(formData),
-      credentials: "include",
     }
   );
 

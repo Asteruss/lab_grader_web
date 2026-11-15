@@ -299,7 +299,9 @@ def test_missing_schedule_falls_back_to_daily_window(tmp_path):
     )
     assert session is not None
     assert session.allows_lab("1") is True
-    assert session_no_from_slot(session.slot_id) == 0
+    # Дневная очередь — пара №1 дня: Пар№ в таблице не пустует.
+    assert session.slot_id == "daily-1"
+    assert session_no_from_slot(session.slot_id) == 1
 
 
 # ---------------------------------------------------------------------------

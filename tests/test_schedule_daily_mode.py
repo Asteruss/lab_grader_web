@@ -103,14 +103,16 @@ def test_daily_window_allows_any_lab(no_schedule_dir):
         assert session.allows_lab(lab) is True
 
 
-def test_daily_window_slot_has_no_pair_number(no_schedule_dir):
-    """slot_id carries no digits -> session_no_from_slot -> 0 -> one queue."""
+def test_daily_window_slot_has_pair_number_one(no_schedule_dir):
+    """Дневная очередь — пара №1 дня: Пар№ в таблице не пустует
+    (в режиме «очередь без расписания» иначе Пар№ оставался пустым)."""
     session = active_session_for(
         "unscheduled-course", "4431", "1",
         datetime(2026, 11, 15, 12, 0), no_schedule_dir,
     )
     assert session is not None
-    assert session_no_from_slot(session.slot_id) == 0
+    assert session.slot_id == "daily-1"
+    assert session_no_from_slot(session.slot_id) == 1
 
 
 @pytest.mark.parametrize(

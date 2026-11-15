@@ -20,6 +20,7 @@ from grading.queue.store import (
     STATUS_WITHDRAWN,
     ensure_history_sheet,
     ensure_today_sheet,
+    ensure_today_sheet as store_ensure_today_sheet,
     find_in_history,
     find_past_queue_sheets,
     read_queue_rows,
@@ -57,11 +58,14 @@ class FakeWorksheet:
         self.values.append([str(value) for value in values])
 
     def batch_update(self, updates, **_kwargs):
+        # real gspread writes the whole values grid starting at the range
         for update in updates:
             cell_range = update["range"]
             column = ord(cell_range[0].upper()) - ord("A") + 1
             row = int(cell_range[1:])
-            self.update_cell(row, column, update["values"][0][0])
+            for i, row_vals in enumerate(update["values"]):
+                for j, value in enumerate(row_vals):
+                    self.update_cell(row + i, column + j, value)
 
 
 class FakeWorksheetNotFound(WorksheetNotFound):
@@ -118,6 +122,8 @@ class FakeSpreadsheet:
 @pytest.fixture(autouse=True)
 def reset_state():
     reset_locks()
+    from grading.queue.cache import reset_queue_cache
+    reset_queue_cache()
 
 
 def _add_queue(spreadsheet, entries, title="Очередь-2026-11-08"):
@@ -170,12 +176,9 @@ def test_ensure_sheets_uses_exact_headers_and_protects_data():
     assert fio_dim["range"]["dimension"] == "COLUMNS"
     assert fio_dim["range"]["endIndex"] == QUEUE_HEADERS.index("ФИО") + 1
     assert fio_dim["properties"]["pixelSize"] == 240
+    # автофильтр всегда (задача #19, п.3а) — таблицы больше нет
     assert any("setBasicFilter" in item for item in requests)
-    tables = [item["addTable"]["table"] for item in requests if "addTable" in item]
-    assert len(tables) == 1
-    assert tables[0]["name"] == "Очередь_2026_11_08"
-    assert [c["columnName"] for c in tables[0]["columnProperties"]] == QUEUE_HEADERS
-    assert [c["columnIndex"] for c in tables[0]["columnProperties"]] == list(range(len(QUEUE_HEADERS)))
+    assert all("addTable" not in item for item in requests)
 
 
 def test_register_appends_waiting_row_and_blocks_duplicate_waiting_fio():
@@ -209,10 +212,38 @@ def test_register_numbers_the_pair_queue_across_labs():
 
     sheet = spreadsheet.sheets["Очередь-2026-11-08"]
     rows = read_queue_rows(sheet)
+    # Постоянная сортировка: после добавления лист лежит в порядке
+    # (группа, пара, позиция) — Сидорова (пара 1) поднялась выше пары 2.
     assert [(row.fio, row.lab, row.session_no, row.position) for row in rows] == [
+        ("Сидорова", "ЛР1", 1, 1),
         ("Новиков", "ЛР2", 2, 1),
         ("Морозова", "ЛР1", 2, 2),
-        ("Сидорова", "ЛР1", 1, 1),
+    ]
+
+
+def test_register_resorts_disordered_sheet():
+    """Постоянная сортировка: физический беспорядок, накопившийся до фикса
+    (пара 9 записана раньше пары 1 и лежит выше), исправляется следующей
+    регистрацией — лист всегда отсортирован до и после добавления."""
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+    sheet = FakeWorksheet("Очередь-2026-11-08", spreadsheet.next_id, [QUEUE_HEADERS])
+    spreadsheet.next_id += 1
+    spreadsheet.sheets[sheet.title] = sheet
+    sheet.append_row([1, "4432", "Новиков", "ЛР2", 9, "Asteruss", "23:29", STATUS_PASSED])
+    sheet.append_row([1, "4432", "Волков", "ЛР2", 1, "Gerasimov", "23:29", STATUS_WITHDRAWN])
+    sheet.append_row([3, "4432", "Морозова", "ЛР2", 9, "hikara33", "23:32", STATUS_WAITING])
+
+    # Новая запись в пару 9 (последний тикет пары): сама по себе она порядок
+    # не ломает, но лист уже разупорядочен — регистрация его пересортирует.
+    assert register(spreadsheet, today, "4432", "Петров", "ЛР2", session_no=9) == 4
+
+    rows = read_queue_rows(sheet)
+    assert [(row.fio, row.session_no, row.position) for row in rows] == [
+        ("Волков", 1, 1),
+        ("Новиков", 9, 1),
+        ("Морозова", 9, 3),
+        ("Петров", 9, 4),
     ]
 
 
@@ -254,9 +285,10 @@ def test_shift_down_only_for_waiting_entries_and_clamps_at_end():
 
     assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 1) == (1, 2)
     rows = read_queue_rows(sheet)
+    # Лист пересортирован (постоянная сортировка): тикеты по порядку.
     assert [(row.fio, row.position) for row in rows] == [
-        ("Иванов", 2),
         ("Петров", 1),
+        ("Иванов", 2),
         ("Сидоров", 3),
     ]
     assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 99) == (2, 3)
@@ -286,13 +318,13 @@ def test_shift_down_rotates_tickets_within_segment_only():
     assert (old, new) == (1, 3)
 
     rows = read_queue_rows(sheet)
-    # В листе порядок строк не меняется; очередь (по билетам):
+    # Лист пересортирован (постоянная сортировка) в порядке тикетов пары:
     # Иванов(1, вызван) -> Сидоров(2) -> Кузнецов(3) -> Петров(5).
     assert [(row.fio, row.position, row.status) for row in rows] == [
         ("Иванов", 1, STATUS_CALLED),      # билет вызванного не тронут
-        ("Петров", 5, STATUS_WAITING),     # взял последний билет сегмента
         ("Сидоров", 2, STATUS_WAITING),    # занял билет Петрова
         ("Кузнецов", 3, STATUS_WAITING),   # занял билет Сидорова
+        ("Петров", 5, STATUS_WAITING),     # взял последний билет сегмента
     ]
 
 
@@ -560,3 +592,5 @@ def test_register_same_fio_different_github_are_separate_entries():
     with pytest.raises(QueueError, match="ALREADY_IN_QUEUE"):
         register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
                  github="c06-ivanov-a")
+
+

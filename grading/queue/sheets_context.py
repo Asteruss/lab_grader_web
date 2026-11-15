@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -11,6 +13,18 @@ from grading.schedule.manual import _parse_date
 from grading.sheets_client import parse_deadline
 
 from .errors import QueueError
+
+# Кэш worksheet-объектов групп: (id(spreadsheet), group_id) -> worksheet.
+# Ключ по id(spreadsheet): у нагрузочного стенда и прод-объектов разные
+# инстансы. get_all_values по-прежнему свежий на каждый вызов.
+_group_ws_cache: dict[tuple[int, str], object] = {}
+# Grid группы кэшируется на 5 c: буст 10 регистраций подряд читает ростер
+# один раз. Ручные правки ростера подхватываются в течение 5 c.
+_group_grid_cache: dict[tuple[int, str], tuple[float, list]] = {}
+_GROUP_GRID_TTL_SECONDS = 5.0
+
+# Разделитель десятичных дробей — свойство таблицы, не меняется (П.10).
+_decimal_separator_cache: dict[int, str] = {}
 
 
 @dataclass(frozen=True)
@@ -22,6 +36,17 @@ class QueueSheetContext:
     lab_column: int
     fio: str
     current_cell_value: str
+
+
+def _decimal_separator_cached(spreadsheet) -> str:
+    """Локаль таблицы постоянна — считываем один раз на объект (П.10)."""
+    key = id(spreadsheet)
+    cached = _decimal_separator_cache.get(key)
+    if cached is not None:
+        return cached
+    separator = get_decimal_separator(spreadsheet)
+    _decimal_separator_cache[key] = separator
+    return separator
 
 
 def _cell(grid: list[list[str]], row_index: int, column_index: int) -> str:
@@ -37,17 +62,33 @@ def load_sheet_context(
     group_id: str,
     lab_config: dict[str, Any],
     username: str,
+    spreadsheet: Any = None,
 ) -> QueueSheetContext:
-    """Resolve one participant and lab cell without writing to the group sheet."""
+    """Resolve one participant and lab cell without writing to the group sheet.
+
+    ``spreadsheet`` — уже открытый объект (кэшированный, П.8): передача его
+    из вызова убирает повторный open_by_key на каждую регистрацию.
+    """
     google_config = course_info.get("google", {})
     spreadsheet_id = google_config.get("spreadsheet")
     if not spreadsheet_id:
         raise QueueError("SHEETS_UNAVAILABLE", "В конфиге курса нет Google Sheets ID")
 
     try:
-        spreadsheet = sheets_client_factory().open_by_key(spreadsheet_id)
-        worksheet = spreadsheet.worksheet(str(group_id))
-        grid = worksheet.get_all_values()
+        if spreadsheet is None:
+            spreadsheet = sheets_client_factory().open_by_key(spreadsheet_id)
+        ws_key = (id(spreadsheet), str(group_id))
+        worksheet = _group_ws_cache.get(ws_key)
+        if worksheet is None:
+            worksheet = spreadsheet.worksheet(str(group_id))
+            _group_ws_cache[ws_key] = worksheet
+        grid_entry = _group_grid_cache.get(ws_key)
+        now = time.monotonic()
+        if grid_entry is not None and now - grid_entry[0] < _GROUP_GRID_TTL_SECONDS:
+            grid = grid_entry[1]
+        else:
+            grid = worksheet.get_all_values()
+            _group_grid_cache[ws_key] = (time.monotonic(), grid)
     except Exception as error:
         raise QueueError("SHEETS_UNAVAILABLE", "Не удалось открыть таблицу группы") from error
 
@@ -107,7 +148,7 @@ def load_sheet_context(
             current_cell_value=current_cell_value,
             student_order=student_order,
             deadline=deadline,
-            decimal_separator=get_decimal_separator(spreadsheet),
+            decimal_separator=_decimal_separator_cached(spreadsheet),
         ),
         row_index=row_index,
         lab_column=lab_column,

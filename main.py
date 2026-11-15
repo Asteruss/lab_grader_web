@@ -16,6 +16,7 @@ import json
 import base64
 import logging
 import threading
+import time
 from datetime import datetime
 from urllib.parse import quote, urlencode
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -91,9 +92,9 @@ from grading.schedule import (
 from grading.queue.errors import QueueError
 from grading.queue.locks import locked_course
 from grading.queue.cache import (
-    get_queue as _get_queue_cache,
-    invalidate_queue as _invalidate_queue_cache,
-    invalidate_course as _invalidate_course_queue_cache,
+    get_queue as _cache_get_queue,
+    get_queue_locked as _cache_get_queue_locked,
+    invalidate_queue as _cache_invalidate_queue,
 )
 from grading.queue.store import (
     QUEUE_SHEET_PREFIX,
@@ -119,7 +120,6 @@ from grading.queue.store import (
     set_status as _queue_set_status,
     call_next as _queue_call_next,
     uncall as _queue_uncall,
-    list_today as _queue_list_today,
     find_past_queue_sheets,
     snapshot_sheet,
     maybe_snapshot_past_days,
@@ -206,12 +206,29 @@ SHEETS_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis
 SHEETS_TIMEOUT_SECONDS = 30
 
 
+_sheets_client_lock = threading.Lock()
+_sheets_client_instance: gspread.Client | None = None
+
+
 def sheets_client() -> gspread.Client:
-    """Authorized gspread client with a request timeout set."""
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, SHEETS_SCOPE)
-    client = gspread.authorize(creds)
-    client.set_timeout(SHEETS_TIMEOUT_SECONDS)
-    return client
+    """Authorized gspread client, созданный один раз (план оптимизации, П.2).
+
+    Service account credentials живут долго; gspread сам обновляет access
+    token, поэтому пересоздавать клиента (file I/O + RSA-подпись) на каждый
+    запрос не нужно.
+    """
+    global _sheets_client_instance
+    if _sheets_client_instance is not None:
+        return _sheets_client_instance
+    with _sheets_client_lock:
+        if _sheets_client_instance is None:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(
+                CREDENTIALS_FILE, SHEETS_SCOPE
+            )
+            client = gspread.authorize(creds)
+            client.set_timeout(SHEETS_TIMEOUT_SECONDS)
+            _sheets_client_instance = client
+    return _sheets_client_instance
 
 
 def _start_background_job(func, *args, name: str) -> None:
@@ -267,6 +284,20 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+@app.exception_handler(Exception)
+async def _catch_all_exception_handler(request: Request, exc: Exception):
+    """Return a 500 JSONResponse so CORSMiddleware can attach CORS headers.
+
+    Without this, an unhandled exception reaches the browser as net::ERR_FAILED
+    with no Access-Control-Allow-Origin header, which the frontend cannot tell
+    apart from a network failure. Specific handlers (HTTPException,
+    RequestValidationError, RateLimitExceeded) still take precedence over this
+    catch-all.
+    """
+    logger.exception(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Внутренняя ошибка сервера"})
+
 # Проверка обязательных переменных окружения
 if not ADMIN_LOGIN or not ADMIN_PASSWORD:
     raise RuntimeError(
@@ -282,10 +313,13 @@ if not GITHUB_TOKEN:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",  # Разрешить запросы с любых источников
-    allow_credentials=True,
-    allow_methods=["*"],  # Разрешить все HTTP-методы
-    allow_headers=["*"],  # Разрешить все заголовки
+    # Cookies убраны везде (очередь + /register, OAuth plan §1): с
+    # allow_credentials=False опция allow_origins=["*"] безопасна, и
+    # credentialed-ответы больше не нужны (браузер блокирует "*" + credentials).
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 signer = TimestampSigner(SECRET_KEY)
 
@@ -1048,47 +1082,24 @@ def register_student(request: Request, course_id: str, group_id: str, student: S
 
         existing_github = sheet.cell(row_idx, github_col_idx).value
 
-        # Build signed student_session cookie from the registration form data.
-        # The queue reads this cookie instead of requiring a separate GitHub OAuth.
-        student_token = build_student_session(
-            signer,
-            github=student.github,
-            fio=full_name,
-            course_id=course_id,
-            group_id=group_id,
-        )
+        # /register only binds the GitHub handle to the student row now (OAuth
+        # plan §2): no student_session cookie is set. Queue mutations
+        # authenticate per-request via a GitHub OAuth code (see
+        # /queue/oauth/start and POST /queue/{register,withdraw,shift}), so no
+        # session survives this request -- several people can register from
+        # the same machine without clobbering each other.
 
         if not existing_github:
             sheet.update_cell(row_idx, github_col_idx, student.github)
             logger.info(f"Successfully registered GitHub '{student.github}' for student '{full_name}'")
-            response = JSONResponse(content={"status": "registered", "message": "Аккаунт GitHub успешно задан"})
-            response.set_cookie(
-                key=STUDENT_SESSION_COOKIE,
-                value=student_token,
-                httponly=True,
-                samesite="lax",
-                max_age=STUDENT_SESSION_MAX_AGE,
-                path="/",
-                secure=False,
-            )
-            return response
+            return {"status": "registered", "message": "Аккаунт GitHub успешно задан. Войдите через GitHub, чтобы записаться в очередь."}
 
         if existing_github == student.github:
             logger.info(f"Student '{full_name}' already registered with GitHub '{student.github}'")
-            response = JSONResponse(content={
+            return {
                 "status": "already_registered",
                 "message": "Этот аккаунт GitHub уже был указан ранее для этого же студента",
-            })
-            response.set_cookie(
-                key=STUDENT_SESSION_COOKIE,
-                value=student_token,
-                httponly=True,
-                samesite="lax",
-                max_age=STUDENT_SESSION_MAX_AGE,
-                path="/",
-                secure=False,
-            )
-            return response
+            }
 
         # Conflict: student tries to set a different GitHub account
         logger.warning(f"GitHub conflict for '{full_name}': existing='{existing_github}', attempted='{student.github}'")
@@ -2982,6 +2993,33 @@ def _require_student_session(request, course_id, group_id):
     return payload["github"], payload.get("fio", "")
 
 
+def _queue_resolve_username_from_code(request: Request, code: str | None) -> str:
+    """Exchange a GitHub OAuth ``code`` for the confirmed student username.
+
+    Replaces the student_session cookie as the source of identity for queue
+    mutations (OAuth plan §3): the username now comes from a fresh token
+    exchange on every request, never from a forgeable cookie. The code lives
+    exactly one request -- it is exchanged here, used for the mutation, and
+    forgotten; nothing is stored.
+    """
+    if not code:
+        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+    username = _exchange_code_for_username(code, _oauth_redirect_uri(request))
+    if username is None:
+        raise HTTPException(status_code=401, detail="OAUTH_FAILED")
+    return username
+
+
+def _queue_verify_student_scope(student_group: str, group_id: str) -> None:
+    """Reject a mutation whose declared group does not match the URL group.
+
+    The path parameter is authoritative; the body field is a cross-check so a
+    student cannot act on another group's queue by editing the request body.
+    """
+    if student_group != group_id:
+        raise HTTPException(status_code=403, detail="GROUP_MISMATCH")
+
+
 def _queue_error_to_http(error: QueueError) -> HTTPException:
     """Translate a QueueError into an HTTPException with the stable code as detail."""
     return HTTPException(status_code=error.http_status, detail=error.code)
@@ -3044,26 +3082,78 @@ def _open_spreadsheet(course_info: dict):
         raise HTTPException(status_code=503, detail="Google Sheets недоступен")
 
 
+# --- Кэши queue-эндпоинтов (план оптимизации, П.2/П.5/П.8) ---
+# _aux_cache сбрасывается нагрузочным стендом (patch_main) перед прогонами.
+_aux_cache: dict = {}
+_aux_lock = threading.Lock()
+_SS_TTL_SECONDS = 60.0
+
+# П.5: snapshot / ensure-today выполняются один раз в день на курс
+# (course_id -> last processed date ISO). Ключ слетает в полночь сам.
+_queue_ready_done: dict[str, str] = {}
+_ready_lock = threading.Lock()
+
+_SS_ERR_503 = HTTPException(status_code=503, detail="Google Sheets недоступен")
+
+
+def _get_spreadsheet(course_info: dict):
+    """Spreadsheet-объект курса с кэшем 60 c (план оптимизации, П.8).
+
+    gspread Spreadsheet — тонкая обёртка над HTTP: переиспользование
+    безопасно, каждый вызов метода делает свежий запрос к API.
+    """
+    spreadsheet_id = course_info.get("google", {}).get("spreadsheet")
+    if not spreadsheet_id:
+        raise HTTPException(status_code=400, detail="Spreadsheet ID not found in course config")
+
+    key = ("ss", spreadsheet_id)
+    entry = _aux_cache.get(key)
+    if entry is not None and time.monotonic() - entry[0] < _SS_TTL_SECONDS:
+        return entry[1]
+
+    client = sheets_client()
+    try:
+        ss = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        logger.error(f"Failed to open spreadsheet: {e}")
+        raise HTTPException(status_code=503, detail="Google Sheets недоступен") from e
+
+    with _aux_lock:
+        _aux_cache[key] = (time.monotonic(), ss)
+    return ss
+
+
 def _ensure_queue_ready(spreadsheet, course_info: dict, course_id: str) -> str:
-    """Run lazy snapshot, create today's sheet, return today_str."""
+    """Run lazy snapshot and create today's sheet — один раз в день (П.5).
+
+    Последующие запросы дня проходят по fast path (ни одного вызова
+    gspread). Флаг слетает сам в полночь (значение != today_str).
+    Инвалидация кэша строк здесь НЕ выполняется — только после реальных
+    мутаций (П.1): иначе кэш не работает вовсе.
+    """
     today_str = _queue_today_str(course_info)
+    if _queue_ready_done.get(course_id) == today_str:
+        return today_str
+
     from datetime import date
     today = date.fromisoformat(today_str)
 
-    # Lazy snapshot: move past-day sheets to history, delete them
-    try:
-        moved = maybe_snapshot_past_days(spreadsheet, today)
-        if moved:
-            logger.info(f"Queue snapshot moved {moved} rows to history for course {course_id}")
-    except Exception as e:
-        logger.exception(f"Queue snapshot failed for course {course_id}: {e}")
+    with _ready_lock:
+        if _queue_ready_done.get(course_id) != today_str:
+            try:
+                moved = maybe_snapshot_past_days(spreadsheet, today)
+                if moved:
+                    logger.info(f"Queue snapshot moved {moved} rows to history for course {course_id}")
+            except Exception as e:
+                logger.exception(f"Queue snapshot failed for course {course_id}: {e}")
 
-    # Invalidate cache after snapshot
-    _invalidate_course_queue_cache(spreadsheet.id, course_id)
-
-    # Ensure today's sheet exists
-    group_ids = _schedule_group_ids(course_id)
-    ensure_today_sheet(spreadsheet, today, group_ids)
+            try:
+                group_ids = _schedule_group_ids(course_id)
+                ensure_today_sheet(spreadsheet, today, group_ids)
+                _queue_ready_done[course_id] = today_str
+            except Exception:
+                # ensure не удался — следующий запрос попробует снова
+                raise
 
     return today_str
 
@@ -3077,7 +3167,29 @@ def _schedule_group_ids(course_id: str) -> list[str]:
         return []
 
 
-class QueueShiftRequest(BaseModel):
+class QueueOAuthActionRequest(BaseModel):
+    """Common body for queue mutations authenticated via a GitHub OAuth code.
+
+    The ``code`` is exchanged server-side for the confirmed GitHub username
+    (``_exchange_code_for_username``); ``student_name``/``student_group`` let
+    the server verify the OAuth'd account actually owns that student row
+    (solo labs only -- team labs identify the queue row by team title, which
+    is itself derived from the GitHub login, so the name check is skipped).
+    """
+    code: str = Field(..., min_length=1)
+    student_name: str = Field(..., min_length=1)
+    student_group: str = Field(..., min_length=1)
+
+
+class QueueRegisterRequest(QueueOAuthActionRequest):
+    pass
+
+
+class QueueWithdrawRequest(QueueOAuthActionRequest):
+    pass
+
+
+class QueueShiftRequest(QueueOAuthActionRequest):
     delta: int = Field(..., ge=1)
 
 
@@ -3109,6 +3221,32 @@ def queue_login(request: Request, course_id: str, group_id: str, lab_id: str):
         "state": state,
     }
     logger.info(f"Redirecting to GitHub OAuth for queue login {course_id}/{group_id}/{lab_id}")
+    return RedirectResponse(
+        url=f"https://github.com/login/oauth/authorize?{urlencode(params)}"
+    )
+
+
+@app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/oauth/start")
+@limiter.limit("20/minute")
+def queue_oauth_start(request: Request, course_id: str, group_id: str, lab_id: str):
+    """Canonical OAuth start for queue mutations (OAuth plan §3).
+
+    Same GitHub redirect as ``/queue/login`` -- kept as a separate route so the
+    frontend can target the plan's canonical URL. GitHub redirects back to
+    ``/join/callback``; when the signed ``state`` carries ``purpose == "queue"``
+    the callback forwards the code to the frontend as ``?queue_code=...`` (no
+    cookie, no exchange -- see ``_handle_queue_callback``).
+    """
+    _resolve_queue_lab(course_id, lab_id)
+    if not GITHUB_OAUTH_CLIENT_ID or not GITHUB_OAUTH_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="OAuth App не настроен")
+    state = _build_queue_state(course_id, group_id, lab_id, "queue")
+    params = {
+        "client_id": GITHUB_OAUTH_CLIENT_ID,
+        "redirect_uri": _oauth_redirect_uri(request),
+        "scope": "read:user",
+        "state": state,
+    }
     return RedirectResponse(
         url=f"https://github.com/login/oauth/authorize?{urlencode(params)}"
     )
@@ -3278,9 +3416,12 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         # the day's queue outlives the session window. Read today's sheet
         # if it exists; never create it here.
         try:
-            spreadsheet = _open_spreadsheet(course_info)
+            spreadsheet = _get_spreadsheet(course_info)
             today_str = _queue_today_str(course_info)
-            _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+            rows = _cache_get_queue(
+                spreadsheet.id, today_str,
+                lambda: _read_today_queue_if_exists(spreadsheet, today_str)[1],
+            )
         except Exception as e:
             # A storage read failure must not break the "closed" view.
             logger.warning(f"queue_status: cannot read today's queue outside session: {e}")
@@ -3291,28 +3432,25 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         # group stays visible (it outlives the session window).
         scoped = [r for r in rows if r.group == group_id]
 
-        student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
-        student = parse_student_session(signer, student_cookie)
-        session_required = (
-            student is None
-            or student.get("course_id") != course_id
-            or student.get("group_id") != group_id
-        )
+        student_name = request.query_params.get("student_name") or ""
+        student_group = request.query_params.get("student_group") or ""
+        session_required = not student_name or student_group != group_id
 
         # Team labs are not resolved in this branch: without an active
         # session we do not make GitHub network calls just for viewing.
         entry = None
         called_entry = None
         if not is_team_lab(lab_config) and not session_required:
-            fio = student.get("fio", "")
+            fio = student_name
             if fio:
-                github = student.get("github", "")
+                # Read-only (OAuth plan §3): no confirmed GitHub username
+                # here, so the waiting/called row is matched by name alone.
                 entry = find_waiting(
-                    rows, group_id, fio, github=github
+                    rows, group_id, fio, github=""
                 )
                 if entry is None:
                     called_entry = find_called(
-                        rows, group_id, fio, github=github
+                        rows, group_id, fio, github=""
                     )
 
         return {
@@ -3331,12 +3469,14 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "session_required": session_required,
         }
 
-    # Session is active - create the sheet and get queue size
-    spreadsheet = _open_spreadsheet(course_info)
+    # Session is active - ensure today's sheet (once/day) and read cached rows
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    rows = read_queue_rows(worksheet)
+    rows = _cache_get_queue(
+        spreadsheet.id, today_str,
+        lambda: read_queue_rows(spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")),
+    )
     lab_short_name = lab_config.get("short-name", lab_key)
     # One pair = one queue (issue #62 review): scope by (group, pair) of the
     # active session; the lab column is only a label of what is defended.
@@ -3348,16 +3488,12 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     ]
 
     # Check student_session cookie
-    student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
-    student = parse_student_session(signer, student_cookie)
-    session_required = (
-        student is None
-        or student.get("course_id") != course_id
-        or student.get("group_id") != group_id
-    )
+    student_name = request.query_params.get("student_name") or ""
+    student_group = request.query_params.get("student_group") or ""
+    session_required = not student_name or student_group != group_id
 
     if session_required:
-        # Queue is open but student hasn't filled the form.
+        # Queue is open but the caller didn't identify themselves.
         # Still return queue_open and queue_size so they can see the queue.
         return {
             "in_queue": False,
@@ -3374,9 +3510,10 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "session_required": True,
         }
 
-    username = student["github"]
-    fio_from_cookie = student.get("fio", "")
-
+    # Read-only (OAuth plan §3): no confirmed GitHub username here. Team labs
+    # key their queue rows by team title, which is resolved from the GitHub
+    # login at register time; without that login the personal entry stays
+    # empty for them. Solo labs look up the waiting/called row by name.
     # Initialize entry and called_entry to None
     entry = None
     called_entry = None
@@ -3387,19 +3524,9 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     team_info = None
     try:
         if is_team_lab(lab_config):
-            team_result = _resolve_queue_team(
-                GitHubClient(GITHUB_TOKEN), course_info, lab_config, username
-            )
-            if team_result is not None:
-                identifier = team_result.title
-                fio = team_result.title
-                team_info = {
-                    "title": team_result.title,
-                    "repo_name": team_result.repo_name,
-                    "members": list(team_result.members),
-                }
+            pass
         else:
-            fio = fio_from_cookie
+            fio = student_name
             identifier = fio
     except QueueError as e:
         return {
@@ -3417,7 +3544,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "error": e.code,
         }
 
-    github_param = "" if is_team_lab(lab_config) else username
+    github_param = ""  # read-only: no confirmed GitHub username available
     entry = (
         find_waiting(rows, group_id, fio, github=github_param)
         if fio
@@ -3429,44 +3556,16 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         else None
     )
 
-    # Check ALREADY_PASSED
-    history_ws = None
-    try:
-        history_ws = ensure_history_sheet(spreadsheet)
-    except Exception:
-        pass
+    # П.6: status read-only — already_passed/ci_status вычисляет POST
+    # /register (реальная проверка), здесь без обращений к Sheets/GitHub.
     already_passed = False
-    if history_ws and fio:
-        already_passed = find_in_history(history_ws, group_id, fio, lab_short_name, STATUS_PASSED)
-
-    # Check CI status from grade cell
     ci_status = "unknown"
-    try:
-        if not is_team_lab(lab_config):
-            ctx = _load_queue_sheet_context(
-                sheets_client, course_info, group_id, lab_config, username
-            )
-            cell = (ctx.current_cell_value or "").strip()
-            if cell.lower().startswith("vv"):
-                ci_status = "passed"
-                already_passed = True
-            elif cell.startswith("v"):
-                ci_status = "passed"
-            elif cell == "x" or cell == "":
-                ci_status = "not_run"
-            else:
-                ci_status = "unknown"
-    except QueueError:
-        ci_status = "unknown"
 
     queue_open = session is not None
     team_lab = is_team_lab(lab_config)
     can_register = (
-        not already_passed
-        and entry is None
+        entry is None
         and called_entry is None
-        # Team CI is checked against the shared repo by the registration endpoint.
-        and (team_lab or ci_status in ("passed", "not_run"))
         and queue_open
     )
 
@@ -3501,9 +3600,14 @@ def _session_dict(session) -> dict | None:
 # --- Register ---
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/register")
-@limiter.limit("10/minute")
-def queue_register(request: Request, course_id: str, group_id: str, lab_id: str):
-    """Register the authenticated student in the defense queue."""
+@limiter.limit("30/minute")
+def queue_register(request: Request, course_id: str, group_id: str, lab_id: str, body: QueueRegisterRequest):
+    """Register the authenticated student in the defense queue.
+
+    Auth is per-request via a GitHub OAuth ``code`` (OAuth plan §3): the server
+    exchanges it for the confirmed username, verifies the declared student row
+    is bound to that username, then registers. No cookie is read or set.
+    """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
 
     # Check schedule window BEFORE creating any sheet
@@ -3511,12 +3615,21 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     if session is None:
         raise HTTPException(status_code=403, detail="QUEUE_CLOSED")
 
-    username, _fio = _require_student_session(request, course_id, group_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    username = _queue_resolve_username_from_code(request, body.code)
+    _queue_verify_student_scope(body.student_group, group_id)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     # Resolve identifier and FIO
     team_repo_name = None
+    # П.10/П.11: контекст загружается один раз и переиспользуется в
+    # ensure_ci_passed (второй вызов loader'а = лишний get_all_values
+    # листа группы). Для командных лаб loader ленивый — вызывается
+    # внутри ensure_ci_passed, когда команда уже известна.
+    ctx_loader = lambda: _load_queue_sheet_context(
+        sheets_client, course_info, group_id, lab_config, username,
+        spreadsheet=spreadsheet,
+    )
     try:
         if is_team_lab(lab_config):
             team_result = _resolve_queue_team(
@@ -3528,13 +3641,17 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
             identifier = team_result.title
             team_repo_name = team_result.repo_name
         else:
-            ctx = _load_queue_sheet_context(
-                sheets_client, course_info, group_id, lab_config, username
-            )
+            ctx = ctx_loader()
             fio = ctx.fio
             identifier = fio
     except QueueError as e:
         raise _queue_error_to_http(e)
+
+    # OAuth plan §3: verify the declared name matches the row bound to the
+    # confirmed GitHub login. Team labs key the queue row by team title
+    # (derived from the login above), so the name check does not apply there.
+    if not is_team_lab(lab_config) and fio != body.student_name:
+        raise HTTPException(status_code=403, detail="STUDENT_MISMATCH")
 
     lab_short_name = lab_config.get("short-name", lab_key)
     session_no = session_no_from_slot(session.slot_id) if session else None
@@ -3554,9 +3671,7 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
             username=username,
             lab_config=lab_config,
             course_info=course_info,
-            context_loader=lambda: _load_queue_sheet_context(
-                sheets_client, course_info, group_id, lab_config, username
-            ),
+            context_loader=ctx_loader,
             repo_name=team_repo_name,
             history_worksheet=history_ws,
             group=group_id,
@@ -3571,6 +3686,15 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     today = date.fromisoformat(today_str)
     group_ids = _schedule_group_ids(course_id)
     signup_time = _queue_now_str(course_info)
+    pre_rows = _cache_get_queue(
+        spreadsheet.id, today_str,
+        lambda: read_queue_rows(spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")),
+    )
+    scoped_count = len([
+        r for r in pre_rows
+        if r.group == group_id
+        and (session_no is None or r.session_no in (None, session_no))
+    ])
     try:
         position = _queue_register(
             spreadsheet, today, group_id, fio, lab_short_name, session_no, group_ids,
@@ -3580,29 +3704,26 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
-
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    # One pair = one queue: the size is the pair queue length, not the lab's.
-    scoped = [
-        r for r in read_queue_rows(worksheet)
-        if r.group == group_id
-        and (session_no is None or r.session_no in (None, session_no))
-    ]
-
-    return {"position": position, "queue_size": len(scoped)}
+    # П.11: кэш НЕ инвалидируется — store.register обновил его in-place
+    # (append_row_to_cache), наблюдатели и следующие записи видят строку
+    # без перечитывания листа.
+    return {"position": position, "queue_size": scoped_count + 1}
 
 
 # --- Withdraw ---
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/withdraw")
-@limiter.limit("10/minute")
-def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str):
-    """Withdraw the authenticated student from the queue."""
+@limiter.limit("5/minute")
+def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str, body: QueueWithdrawRequest):
+    """Withdraw the authenticated student from the queue.
+
+    Auth via GitHub OAuth ``code`` (OAuth plan §3); no cookie.
+    """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
-    username, _fio = _require_student_session(request, course_id, group_id)
+    username = _queue_resolve_username_from_code(request, body.code)
+    _queue_verify_student_scope(body.student_group, group_id)
 
     # Resolve FIO
     try:
@@ -3620,6 +3741,11 @@ def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str)
             fio = ctx.fio
     except QueueError as e:
         raise _queue_error_to_http(e)
+
+    # OAuth plan §3: the declared name must match the row bound to the
+    # confirmed GitHub login (team labs are keyed by team title, skip).
+    if not is_team_lab(lab_config) and fio != body.student_name:
+        raise HTTPException(status_code=403, detail="STUDENT_MISMATCH")
 
     session_no = None
     from datetime import date
@@ -3633,14 +3759,14 @@ def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"status": "withdrawn"}
 
 
 # --- Shift ---
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/shift")
-@limiter.limit("10/minute")
+@limiter.limit("5/minute")
 def queue_shift(
     request: Request,
     course_id: str,
@@ -3648,11 +3774,16 @@ def queue_shift(
     lab_id: str,
     body: QueueShiftRequest,
 ):
-    """Shift the authenticated student backward in the queue."""
+    """Shift the authenticated student backward in the queue.
+
+    Auth via GitHub OAuth ``code`` (OAuth plan §3); no cookie. The body also
+    carries ``delta`` (>= 1).
+    """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
-    username, _fio = _require_student_session(request, course_id, group_id)
+    username = _queue_resolve_username_from_code(request, body.code)
+    _queue_verify_student_scope(body.student_group, group_id)
 
     # Resolve FIO
     try:
@@ -3671,6 +3802,11 @@ def queue_shift(
     except QueueError as e:
         raise _queue_error_to_http(e)
 
+    # OAuth plan §3: declared name must match the row bound to the confirmed
+    # GitHub login (team labs keyed by team title, skip).
+    if not is_team_lab(lab_config) and fio != body.student_name:
+        raise HTTPException(status_code=403, detail="STUDENT_MISMATCH")
+
     from datetime import date
     today = date.fromisoformat(today_str)
 
@@ -3682,7 +3818,7 @@ def queue_shift(
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"old_position": old_pos, "new_position": new_pos}
 
 
@@ -3718,14 +3854,6 @@ def _read_today_queue_if_exists(spreadsheet, today_str: str):
     return worksheet, read_queue_rows(worksheet)
 
 
-def _view_rank(row) -> int:
-    if row.status == STATUS_CALLED:
-        return 0
-    if row.status == STATUS_WAITING:
-        return 1
-    return 2
-
-
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue")
 @limiter.limit("30/minute")
 def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
@@ -3739,9 +3867,12 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
         # stay visible until they are served — the day's queue outlives the
         # session window. Read the sheet if it exists; never create it here.
         try:
-            spreadsheet = _open_spreadsheet(course_info)
+            spreadsheet = _get_spreadsheet(course_info)
             today_str = _queue_today_str(course_info)
-            _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+            rows = _cache_get_queue(
+                spreadsheet.id, today_str,
+                lambda: _read_today_queue_if_exists(spreadsheet, today_str)[1],
+            )
         except Exception as e:
             # A storage read failure must not break the "closed" view.
             logger.warning(f"queue_list: cannot read today's queue outside session: {e}")
@@ -3773,16 +3904,22 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
             "size": len(filtered_rows),
             "is_team_lab": is_team_lab(lab_config),
             "queue_open": False,
+            "session": None,
+            "next_session": _session_dict(_queue_next_session(course_id, group_id, lab_key)),
         }
 
     # Get session_no from query params (optional)
     session_no = _get_session_no_from_request(request)
 
-    spreadsheet = _open_spreadsheet(course_info)
+    next_sess = _queue_next_session(course_id, group_id, lab_key)
+
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    rows = read_queue_rows(worksheet)
+    rows = _cache_get_queue(
+        spreadsheet.id, today_str,
+        lambda: read_queue_rows(spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")),
+    )
 
     # One pair = one queue (issue #62 review): scope by (group, pair);
     # the lab column is only a label and stays in the payload.
@@ -3792,7 +3929,29 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
         and (session_no is None or r.session_no in (None, session_no))
     ]
     filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
+
+    # П.14: персональное состояние запрашивающего студента — из кэша,
+    # без отдельного GET /queue/status. Read-only (OAuth plan §3): студент
+    # идентифицируется query-параметрами, не cookie; github неизвестен, поэтому
+    # строку ищем по ФИО.
+    student_name = request.query_params.get("student_name") or ""
+    student_group = request.query_params.get("student_group") or ""
+    me = None
+    if student_name and student_group == group_id:
+        fio = student_name
+        entry = find_waiting(rows, group_id, fio, github="")
+        called_entry = (
+            find_called(rows, group_id, fio, github="")
+            if entry is None else None
+        )
+        me = {
+            "in_queue": entry is not None or called_entry is not None,
+            "position": entry.position if entry else None,
+            "called": called_entry is not None,
+            "queue_size": len(filtered_rows),
+        }
     return {
+        "me": me,
         "queue": [
             {
                 "position": r.position,
@@ -3823,7 +3982,7 @@ def admin_queue_today(
 ):
     admin = _ensure_admin_resolved(request, admin)
     course_info = get_course_by_id(course_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _queue_today_str(course_info)
 
     _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
@@ -3884,7 +4043,7 @@ def queue_set_status(
     """Mark a student's or team's queue entry with a defense result."""
     admin = _ensure_admin_resolved(request, admin)
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     from datetime import date
@@ -3899,7 +4058,7 @@ def queue_set_status(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"status": "updated", "new_status": body.status}
 
 
@@ -3924,7 +4083,7 @@ def queue_call(
     """
     admin = _ensure_admin_resolved(request, admin)
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     from datetime import date
@@ -3940,7 +4099,7 @@ def queue_call(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {
         "called": {
             "fio": called.fio,
@@ -3968,7 +4127,7 @@ def queue_uncall(
         raise HTTPException(status_code=422, detail="identifier required")
 
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     from datetime import date
@@ -3983,7 +4142,7 @@ def queue_uncall(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"status": "returned"}
 
 
@@ -4103,7 +4262,7 @@ def queue_snapshot(
     admin = _ensure_admin_resolved(request, admin)
 
     course_info = get_course_by_id(course_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
 
     today_str = _queue_today_str(course_info)
     from datetime import date
@@ -4115,7 +4274,7 @@ def queue_snapshot(
         logger.exception(f"Manual snapshot failed for course {course_id}: {e}")
         raise HTTPException(status_code=500, detail="Не удалось выполнить snapshot")
 
-    _invalidate_course_queue_cache(spreadsheet.id, course_id)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"moved_rows": moved}
 
 # --- OAuth callback extension: handle purpose="queue" ---
@@ -4137,34 +4296,25 @@ def queue_snapshot(
 # And add this helper function:
 
 def _handle_queue_callback(request: Request, code: str | None, payload: dict):
-    """Handle OAuth callback for queue login (no repo provisioning)."""
+    """OAuth callback for queue mutations: redirect to the frontend with the code.
+
+    Per the OAuth plan, no cookie is set and no token exchange happens here --
+    the code is exchanged per-request inside POST /queue/{register,withdraw,shift}
+    via ``_exchange_code_for_username``. The browser is sent back to the lab
+    page with ``?queue_code=...`` so the frontend can POST it to the mutation
+    endpoint. GitHub redirecting without a code (user denied / error) drops the
+    pending action silently.
+    """
     course_id = payload["course_id"]
     group_id = payload["group_id"]
     lab_id = payload["lab_id"]
 
+    base = _queue_login_redirect(course_id, group_id, lab_id)
     if not code:
-        return RedirectResponse(url=_queue_login_redirect(course_id, group_id, lab_id))
+        return RedirectResponse(url=base)
 
-    username = _exchange_code_for_username(code, _oauth_redirect_uri(request))
-    if username is None:
-        return RedirectResponse(url=_queue_login_redirect(course_id, group_id, lab_id))
-
-    logger.info(f"Queue OAuth confirmed username '{username}' for {course_id}/{group_id}/{lab_id}")
-
-    # Resolve lab_key for the cookie
-    course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-
-    response = RedirectResponse(url=_queue_login_redirect(course_id, group_id, lab_id))
-    response.set_cookie(
-        key=QUEUE_SESSION_COOKIE,
-        value=build_queue_session(signer, username, course_id, group_id, lab_key),
-        httponly=True,
-        samesite="lax",
-        max_age=QUEUE_SESSION_MAX_AGE,
-        path="/",
-        secure=False,
-    )
-    return response
+    sep = "&" if "?" in base else "?"
+    return RedirectResponse(url=f"{base}{sep}queue_code={code}")
 
 
 
