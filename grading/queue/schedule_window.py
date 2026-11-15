@@ -165,7 +165,9 @@ def _sessions_from(
 # It is cached per (course, group, day, timezone) -- one entry per day instead
 # of the many per-pair windows a real schedule would produce.
 
-_DAILY_SLOT_ID = "daily"  # no digits -> session_no_from_slot -> 0
+# "1" на конце даёт session_no_from_slot -> 1: дневная очередь — это
+# пара №1 дня, Пар№ в таблице не пустует (issue #62).
+_DAILY_SLOT_ID = "daily-1"
 
 
 @dataclass(frozen=True)
