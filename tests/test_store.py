@@ -7,13 +7,17 @@ from grading.queue.errors import QueueError
 from grading.queue.store import (
     HISTORY_HEADERS,
     QUEUE_HEADERS,
+    QUEUE_SHEET_ROWS,
+    QUEUE_STATUS_CHOICES,
     STATUS_ABSENT,
+    STATUS_BG_COLORS,
+    STATUS_CALLED,
+    STATUS_COL_INDEX,
     STATUS_FAILED,
     STATUS_NOT_REACHED,
     STATUS_PASSED,
     STATUS_WAITING,
     STATUS_WITHDRAWN,
-    STATUS_CALLED,
     ensure_history_sheet,
     ensure_today_sheet,
     find_in_history,
@@ -70,6 +74,7 @@ class FakeSpreadsheet:
         self.sheets = {}
         self.next_id = 1
         self.metadata_requests = []
+        self.created_sheets = []
 
     def worksheet(self, title):
         if title not in self.sheets:
@@ -80,6 +85,7 @@ class FakeSpreadsheet:
         return list(self.sheets.values())
 
     def add_worksheet(self, title, rows, cols):
+        self.created_sheets.append((title, rows, cols))
         sheet = FakeWorksheet(title, self.next_id)
         self.next_id += 1
         self.sheets[title] = sheet
@@ -137,7 +143,38 @@ def test_ensure_sheets_uses_exact_headers_and_protects_data():
     assert history.row_values(1) == HISTORY_HEADERS
     requests = spreadsheet.metadata_requests
     assert any("addProtectedRange" in item for item in requests)
-    assert sum("addFilterView" in item for item in requests) == 10
+    # задача #19: filter views заменены нативным автофильтром
+    assert sum("addFilterView" in item for item in requests) == 0
+    # задача #19: dropdown со всеми статусами, цвет статуса, автофильтр,
+    # лист-«таблица», диапазон до 200 строк
+    assert ("Очередь-2026-11-08", 200, len(QUEUE_HEADERS)) in spreadsheet.created_sheets
+    assert ("История_очереди", 200, len(HISTORY_HEADERS)) in spreadsheet.created_sheets
+    validation = next(item["setDataValidation"] for item in requests if "setDataValidation" in item)
+    assert validation["range"]["endRowIndex"] == QUEUE_SHEET_ROWS
+    dropdown = [v["userEnteredValue"] for v in validation["rule"]["condition"]["values"]]
+    assert dropdown == QUEUE_STATUS_CHOICES
+    assert "вызван" in dropdown
+    format_rules = [item["addConditionalFormatRule"]["rule"] for item in requests if "addConditionalFormatRule" in item]
+    assert len(format_rules) == len(STATUS_BG_COLORS)
+    rule_ranges = [r["ranges"][0] for r in format_rules]
+    assert all(
+        rng["startRowIndex"] == 1
+        and rng["endRowIndex"] == QUEUE_SHEET_ROWS
+        and rng["startColumnIndex"] == STATUS_COL_INDEX
+        for rng in rule_ranges
+    )
+    rule_conditions = [r["booleanRule"]["condition"]["values"][0]["userEnteredValue"] for r in format_rules]
+    assert sorted(rule_conditions) == sorted(STATUS_BG_COLORS)
+    dims = [item["updateDimensionProperties"] for item in requests if "updateDimensionProperties" in item]
+    fio_dim = next(d for d in dims if d["range"]["startColumnIndex"] == QUEUE_HEADERS.index("ФИО"))
+    assert fio_dim["range"]["dimension"] == "COLUMNS"
+    assert fio_dim["properties"]["pixelSize"] == 240
+    assert any("setBasicFilter" in item for item in requests)
+    tables = [item["addTable"]["table"] for item in requests if "addTable" in item]
+    assert len(tables) == 1
+    assert tables[0]["name"] == "Очередь_2026_11_08"
+    assert [c["columnName"] for c in tables[0]["columnProperties"]] == QUEUE_HEADERS
+    assert [c["columnIndex"] for c in tables[0]["columnProperties"]] == list(range(len(QUEUE_HEADERS)))
 
 
 def test_register_appends_waiting_row_and_blocks_duplicate_waiting_fio():

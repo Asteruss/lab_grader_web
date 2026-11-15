@@ -1,16 +1,35 @@
 /**
- * Lab Defense Queue — автозакрытие очереди (Google Apps Script), версия 2.2.
+ * Lab Defense Queue — автозакрытие очереди (Google Apps Script), версия 2.3.
  *
- * Изменения относительно версии 2.1:
- *   - формат листа очереди: 8 колонок, «Статус» теперь ПОСЛЕДНЯЯ колонка;
- *   - формат листа истории: 9 колонок (добавлены GitHub и Время перед Статусом).
+ * Изменения относительно версии 2.2:
+ *   1. Служебный лист autoclose_status БОЛЬШЕ НЕ НУЖЕН: всё состояние скрипта
+ *      хранится в Script Properties (PropertiesService) — внутри проекта
+ *      скрипта. Лист от версии 2.x при первом прогоне переносится в свойства
+ *      и автоматически удаляется из таблицы.
+ *   2. Часовой пояс «сегодня» берётся из настроек САМОЙ ТАБЛИЦЫ
+ *      (Файл → Настройки), а не из ключа utc_offset. Поставьте таблице
+ *      часовой пояс курса один раз — ключ utc_offset больше не нужен.
+ *   3. Выравнивание/формат истории: перед дописыванием строк целевой
+ *      диапазон форматируется как plain text ('@'). Раньше Sheets на лету
+ *      превращал «2026-11-11» в настоящую дату (выравнивание вправо) и
+ *      числа — в числа, отчего строки истории выглядели «вразнобой».
+ *      Теперь все строки хранятся текстом, единообразно с backend
+ *      (appendCells со stringValue).
+ *   4. Аренда copy_lease удалена: она была нужна для координации с backend,
+ *      а backend в неё не играет. От одновременных запусков самого скрипта
+ *      защищает LockService. Защита #16 усилена: «лист изменился» проверяется
+ *      ДО любых записей — при правке во время закрытия ни история, ни лист
+ *      не затрагиваются, свежая правка преподавателя теряться не может.
+ *
+ *   5. Меню зависит от состояния: «Включить автозакрытие» видно только пока
+ *      скрипт не установлен (нет триггера), «Выключить» — только когда
+ *      установлен; «Разрешить/Запретить закрытие» — по значению script_enabled.
+ *      Меню перестраивается при перезагрузке страницы таблицы.
  *
  * Унаследовано из версии 2.1:
- *   1. installTriggers() по умолчанию ставит script_enabled=TRUE,
- *      если backend ещё не задал значение.
- *   2. Пункты меню «Разрешить/запретить скрипту закрытие» —
- *      повторяют backend-овскую «галочку в интерфейсе» из контракта.
- *   3. showStatus() показывает и copy_lease (удобно при разборе гонок).
+ *   - installTriggers() по умолчанию ставит script_enabled=TRUE;
+ *   - пункты меню «Разрешить/запретить скрипту закрытие»;
+ *   - showStatus() показывает диагностику (теперь из свойств).
  *
  * Что делает closeDay():
  *   для каждого листа «Очередь-YYYY-MM-DD» с датой СТРОГО раньше сегодняшней
@@ -30,22 +49,19 @@
  *   - формат строки истории:  Дата | ПОЗИЦИЯ | ГРУППА | ФИО | ЛР | Пар№ | GitHub | Время | Статус;
  *   - при повторном запуске строки сверяются как мультимножество по Дате,
  *     ГРУППЕ, ФИО, ЛР и Пар№; повторные записи сохраняются отдельно;
- *   - перед копированием проверять и брать аренду copy_lease на листе autoclose_status;
- *   - значения служебного листа autoclose_status (ключ | значение):
- *       пишет скрипт:  installed_at, last_run, last_success, last_error,
- *                      last_rows_copied, script_version, copy_lease,
- *                      script_enabled (по умолчанию TRUE при установке)
- *       пишет backend: script_enabled (TRUE/FALSE, галочка в интерфейсе),
- *                      utc_offset (например +03:00, из timezone курса),
- *                      service_account_email (для защиты истории)
+ *   - все значения истории хранятся ТЕКСТОМ (формат '@'), в том же виде,
+ *     в каком их пишет backend (appendCells со stringValue);
+ *   - скрипт самодостаточен: backend ничего не пишет в таблицу для него.
+ *     Состояние скрипта — в Script Properties, часовой пояс «сегодня» —
+ *     в настройках таблицы.
  */
 
-const VERSION = '2.2';
+const VERSION = '2.4';
 
 const QUEUE_PREFIX = 'Очередь-';
 const QUEUE_SHEET_RE = /^Очередь-(\d{4}-\d{2}-\d{2})$/;
 const HISTORY_SHEET = 'История_очереди';
-const STATUS_SHEET = 'autoclose_status';
+const LEGACY_STATUS_SHEET = 'autoclose_status'; // лист версий 2.x: значения переносятся в свойства
 const QUEUE_COLUMNS = 8;   // ПОЗИЦИЯ..Статус
 const HISTORY_COLUMNS = 9; // Дата + ПОЗИЦИЯ..Статус
 const HISTORY_HEADERS = ['Дата', 'ПОЗИЦИЯ', 'ГРУППА', 'ФИО', 'ЛР', 'Пар№', 'GitHub', 'Время', 'Статус'];
@@ -55,24 +71,80 @@ const STATUS_NOT_REACHED = 'не_дошло';
 const NOT_FINISHED = ['ждёт', ''];
 
 const TRIGGER_HOUR = 2;            // ежедневный запуск около 02:50
-const LEASE_OWNER = 'script';
-const LEASE_TTL_MS = 5 * 60 * 1000;
 const LOCK_WAIT_MS = 30000;
+
+/* ---------- Служебные свойства (вместо листа autoclose_status) ---------- */
+
+function prop_(key) {
+  return PropertiesService.getScriptProperties().getProperty(key) || '';
+}
+
+function setProp_(key, value) {
+  const properties = PropertiesService.getScriptProperties();
+  if (value === '' || value === null || value === undefined) {
+    properties.deleteProperty(key);
+  } else {
+    properties.setProperty(key, String(value));
+  }
+}
+
+/**
+ * Перенос значений из старого листа autoclose_status (версии 2.x) в свойства.
+ * Лист — чисто служебный, после переноса удаляется (если удалить не вышло,
+ * например из-за защиты, — он останется и попытка повторится при следующем
+ * прогоне; статус напомнит о нём).
+ */
+function migrateLegacyStatusSheet_(ss) {
+  const legacy = ss.getSheetByName(LEGACY_STATUS_SHEET);
+  if (!legacy) return;
+  const last = legacy.getLastRow();
+  if (last >= 2) {
+    legacy.getRange(2, 1, last - 1, 2).getValues().forEach(row => {
+      const key = String(row[0]).trim();
+      const value = String(row[1]).trim();
+      if (!key || !value) return;
+      // utc_offset заменён часовым поясом таблицы, copy_lease удалён.
+      if (key === 'utc_offset' || key === 'copy_lease') return;
+      if (prop_(key) === '') setProp_(key, value);
+    });
+  }
+  try {
+    ss.deleteSheet(legacy);
+  } catch (e) {
+    // защищён/заблокирован — попробуем в следующий раз, статус напомнит
+  }
+}
 
 /* ---------- Меню ---------- */
 
+/**
+ * Меню зависит от состояния: показываем только релевантные действия.
+ * Состояние читается из Script Properties — они доступны в onOpen.
+ * При самом первом открытии (авторизации скрипта ещё нет) чтение может
+ * упасть — тогда показываем полный набор, лишние пункты безвредны.
+ * Меню перестраивается при перезагрузке страницы таблицы.
+ */
 function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Очередь')
-    .addItem('Включить автозакрытие', 'installTriggers')
-    .addItem('Выключить автозакрытие', 'removeTriggers')
-    .addSeparator()
-    .addItem('Разрешить скрипту закрытие', 'enableScript')
-    .addItem('Запретить скрипту закрытие', 'disableScript')
-    .addSeparator()
-    .addItem('Статус автозакрытия', 'showStatus')
-    .addItem('Защитить историю', 'protectHistory')
-    .addToUi();
+  const ui = SpreadsheetApp.getUi();
+  const menu = ui.createMenu('Очередь');
+
+  let installed = null;
+  let enabled = null;
+  try {
+    installed = prop_('installed_at') !== '';
+    enabled = prop_('script_enabled') === 'TRUE';
+  } catch (e) {
+    // AuthMode.LIMITED без авторизации — состояние нечитаемо, показываем всё
+  }
+
+  if (installed !== true) menu.addItem('Включить автозакрытие', 'installTriggers');
+  if (installed !== false) menu.addItem('Выключить автозакрытие', 'removeTriggers');
+  if (enabled !== true) menu.addItem('Разрешить скрипту закрытие', 'enableScript');
+  if (enabled !== false) menu.addItem('Запретить скрипту закрытие', 'disableScript');
+  menu.addSeparator();
+  menu.addItem('Статус автозакрытия', 'showStatus');
+  menu.addItem('Защитить историю', 'protectHistory');
+  menu.addToUi();
 }
 
 /* ---------- Установка ---------- */
@@ -80,12 +152,12 @@ function onOpen() {
 /** Запускается один раз преподавателем. Создаёт ежедневный триггер. */
 function installTriggers() {
   const ss = SpreadsheetApp.getActive();
-  ensureStatusSheet_(ss);
+  migrateLegacyStatusSheet_(ss);
 
-  // По умолчанию скрипт включён. Если backend уже задал
-  // script_enabled (TRUE или FALSE), не перезаписываем его решение.
-  if (getStatus_(ss, 'script_enabled') === '') {
-    setStatus_(ss, 'script_enabled', 'TRUE');
+  // По умолчанию скрипт включён. Если состояние уже есть (меню или legacy) —
+  // не перезаписываем решение.
+  if (prop_('script_enabled') === '') {
+    setProp_('script_enabled', 'TRUE');
   }
 
   ScriptApp.getProjectTriggers()
@@ -99,35 +171,32 @@ function installTriggers() {
     .nearMinute(50)
     .create();
 
-  setStatus_(ss, 'installed_at', nowIso_());
-  setStatus_(ss, 'script_version', VERSION);
+  setProp_('installed_at', nowIso_(ss));
+  setProp_('script_version', VERSION);
 
   closeDay(); // первый прогон сразу
-  notify_('Автозакрытие включено: ежедневно около 02:50. script_enabled=' +
-          getStatus_(ss, 'script_enabled') + '. Состояние: лист «' + STATUS_SHEET + '».');
+  notify_('Автозакрытие включено: ежедневно около 02:50.\n' +
+    'Часовой пояс «сегодня»: ' + ss.getSpreadsheetTimeZone() +
+    ' — проверьте Файл → Настройки таблицы (должен совпадать с курсом).\n' +
+    'Отключение: Очередь → Запретить скрипту закрытие / Выключить автозакрытие.');
 }
 
 function removeTriggers() {
-  const ss = SpreadsheetApp.getActive();
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'closeDay')
     .forEach(t => ScriptApp.deleteTrigger(t));
-  setStatus_(ss, 'installed_at', '');
-  notify_('Автозакрытие отключено (триггеры удалены). script_enabled не изменён.');
+  setProp_('installed_at', '');
+  notify_('Автозакрытие отключено (триггеры удалены). script_enabled не изменён.\nОбновите страницу — меню перестроится.');
 }
 
-/* Ручное управление script_enabled, как в контракте «галочка в интерфейсе». */
+/* Ручное управление script_enabled. */
 function enableScript() {
-  const ss = SpreadsheetApp.getActive();
-  ensureStatusSheet_(ss);
-  setStatus_(ss, 'script_enabled', 'TRUE');
+  setProp_('script_enabled', 'TRUE');
   notify_('Скрипту разрешено закрытие (script_enabled=TRUE).');
 }
 
 function disableScript() {
-  const ss = SpreadsheetApp.getActive();
-  ensureStatusSheet_(ss);
-  setStatus_(ss, 'script_enabled', 'FALSE');
+  setProp_('script_enabled', 'FALSE');
   notify_('Скрипту запрещено закрытие (script_enabled=FALSE).');
 }
 
@@ -140,32 +209,27 @@ function closeDay() {
 
   const ss = SpreadsheetApp.getActive();
   try {
-    ensureStatusSheet_(ss);
-    setStatus_(ss, 'last_run', nowIso_());
+    migrateLegacyStatusSheet_(ss);
+    setProp_('last_run', nowIso_(ss));
 
-    if (isDisabled_(ss)) return;           // преподаватель или backend сняли галочку
-    if (!acquireLease_(ss)) return;        // backend сейчас сам закрывает день
+    if (isDisabled_()) return;             // преподаватель запретил скрипт
 
     const errors = [];
     let copied = 0;
-    try {
-      const today = todayStr_(ss);
-      ss.getSheets().forEach(sheet => {
-        const m = QUEUE_SHEET_RE.exec(sheet.getName());
-        if (!m || m[1] >= today) return;
-        try {
-          copied += closeSheet_(ss, sheet, m[1]);
-        } catch (e) {
-          errors.push(sheet.getName() + ': ' + e.message);
-        }
-      });
-    } finally {
-      releaseLease_(ss);
-    }
+    const today = todayStr_(ss);
+    ss.getSheets().forEach(sheet => {
+      const m = QUEUE_SHEET_RE.exec(sheet.getName());
+      if (!m || m[1] >= today) return;     // только строго прошлые даты
+      try {
+        copied += closeSheet_(ss, sheet, m[1]);
+      } catch (e) {
+        errors.push(sheet.getName() + ': ' + e.message);
+      }
+    });
 
-    setStatus_(ss, 'last_rows_copied', copied);
-    setStatus_(ss, 'last_error', errors.join(' | '));
-    if (errors.length === 0) setStatus_(ss, 'last_success', nowIso_());
+    setProp_('last_rows_copied', String(copied));
+    setProp_('last_error', errors.join(' | '));
+    if (errors.length === 0) setProp_('last_success', nowIso_(ss));
   } finally {
     lock.releaseLock();
   }
@@ -177,33 +241,59 @@ function closeSheet_(ss, sheet, dateStr) {
   const rows = readQueueRows_(sheet, dateStr);
   let copied = 0;
 
+  // Защита #16 — ДО любых записей: если лист изменился с момента чтения
+  // (преподаватель правит прошлый день прямо сейчас), не пишем ничего и
+  // не удаляем лист. Следующий прогон прочитает свежее состояние целиком;
+  // идемпотентный ключ без статуса гарантированно не теряет новую правку.
+  if (JSON.stringify(readQueueRows_(sheet, dateStr)) !== JSON.stringify(rows)) {
+    throw new Error('лист изменился во время закрытия, повтор при следующем запуске');
+  }
+
   if (rows.length > 0) {
     const existingCounts = readHistoryCounts_(history, dateStr);
     const seenCounts = {};
+    const pending = [];
     rows.forEach(r => {
       const key = rowKey_(r);
       seenCounts[key] = (seenCounts[key] || 0) + 1;
       if (seenCounts[key] <= (existingCounts[key] || 0)) return;
-      history.appendRow(r);
-      copied += 1;
+      pending.push(r);
     });
-    SpreadsheetApp.flush();
 
-    // контроль полноты
-    const after = readHistoryCounts_(history, dateStr);
-    Object.keys(seenCounts).forEach(key => {
-      if ((after[key] || 0) < seenCounts[key]) {
-        throw new Error('строки не попали в историю: ' + key);
-      }
-    });
+    if (pending.length > 0) {
+      appendHistoryRows_(history, pending);
+      copied = pending.length;
+      SpreadsheetApp.flush();
+
+      // контроль полноты (appendRow не атомарен, как batch у backend)
+      const after = readHistoryCounts_(history, dateStr);
+      Object.keys(seenCounts).forEach(key => {
+        if ((after[key] || 0) < seenCounts[key]) {
+          throw new Error('строки не попали в историю: ' + key);
+        }
+      });
+    }
   }
 
-  // лист удаляем, только если он не изменился с момента чтения
-  if (JSON.stringify(readQueueRows_(sheet, dateStr)) !== JSON.stringify(rows)) {
-    throw new Error('лист изменился во время закрытия, повтор при следующем запуске');
-  }
   ss.deleteSheet(sheet);
   return copied;
+}
+
+/**
+ * Дописывает строки в историю единообразным текстом.
+ * Sheets разбирает значения при записи по формату ячеек: без '@' строка
+ * «2026-11-11» превращается в настоящую дату (выравнивание вправо), числа —
+ * в числа. Формат plain text на целевом диапазоне ДО записи держит все
+ * строки текстом, единообразно с backend (appendCells со stringValue).
+ */
+function appendHistoryRows_(history, pending) {
+  const startRow = history.getLastRow() + 1;
+  const needed = startRow + pending.length - 1;
+  if (needed > history.getMaxRows()) {
+    history.insertRowsAfter(history.getMaxRows(), needed - history.getMaxRows());
+  }
+  history.getRange(startRow, 1, pending.length, HISTORY_COLUMNS).setNumberFormat('@');
+  pending.forEach(r => history.appendRow(r));
 }
 
 /**
@@ -249,7 +339,7 @@ function readHistoryCounts_(history, dateStr) {
 
 function cellDate_(v) {
   if (v instanceof Date) {
-    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    return Utilities.formatDate(v, SpreadsheetApp.getActive().getSpreadsheetTimeZone(), 'yyyy-MM-dd');
   }
   return String(v).trim();
 }
@@ -262,8 +352,9 @@ function ensureHistorySheet_(ss) {
     sheet = ss.insertSheet(HISTORY_SHEET);
     sheet.getRange(1, 1, 1, HISTORY_COLUMNS).setValues([HISTORY_HEADERS]);
     sheet.setFrozenRows(1);
+    // весь столбец набора — plain text (см. appendHistoryRows_)
+    sheet.getRange(1, 1, sheet.getMaxRows(), HISTORY_COLUMNS).setNumberFormat('@');
   }
-  sheet.getRange('A:A').setNumberFormat('@');
   return sheet;
 }
 
@@ -277,86 +368,38 @@ function protectHistory() {
   protection.removeEditors(protection.getEditors());
   if (protection.canDomainEdit()) protection.setDomainEdit(false);
 
-  const email = getStatus_(ss, 'service_account_email');
+  let email = prop_('service_account_email');
+  if (!email) {
+    try {
+      const ui = SpreadsheetApp.getUi();
+      const result = ui.prompt(
+        'Защитить историю',
+        'Адрес сервисного аккаунта backend (или пусто — пропустить):',
+        ui.ButtonSet.OK_CANCEL
+      );
+      if (result.getSelectedButton() === ui.Button.OK) {
+        email = result.getResponseText().trim();
+        if (email) setProp_('service_account_email', email);
+      }
+    } catch (e) {
+      // запуск без интерфейса — просто защищаем без доп. редактора
+    }
+  }
   if (email) protection.addEditor(email);
   notify_(email
     ? 'История защищена. Редактор: владелец и ' + email + '.'
-    : 'История защищена. Адрес сервисного аккаунта не найден в «' + STATUS_SHEET +
-      '» (ключ service_account_email): добавьте его редактором защиты вручную.');
-}
-
-/* ---------- Служебный лист autoclose_status ---------- */
-
-function ensureStatusSheet_(ss) {
-  let sheet = ss.getSheetByName(STATUS_SHEET);
-  if (!sheet) {
-    sheet = ss.insertSheet(STATUS_SHEET);
-    sheet.getRange(1, 1, 1, 2).setValues([['key', 'value']]);
-    sheet.getRange('B:B').setNumberFormat('@');
-  }
-  return sheet;
-}
-
-function getStatus_(ss, key) {
-  const sheet = ss.getSheetByName(STATUS_SHEET);
-  if (!sheet || sheet.getLastRow() < 2) return '';
-  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
-  for (let i = 0; i < rows.length; i++) {
-    if (rows[i][0] === key) return String(rows[i][1]);
-  }
-  return '';
-}
-
-function setStatus_(ss, key, value) {
-  const sheet = ensureStatusSheet_(ss);
-  const last = sheet.getLastRow();
-  if (last >= 2) {
-    const keys = sheet.getRange(2, 1, last - 1, 1).getValues();
-    for (let i = 0; i < keys.length; i++) {
-      if (keys[i][0] === key) {
-        sheet.getRange(i + 2, 2).setNumberFormat('@').setValue(String(value));
-        return;
-      }
-    }
-  }
-  sheet.appendRow([key, String(value)]);
-}
-
-function isDisabled_(ss) {
-  return getStatus_(ss, 'script_enabled').trim().toUpperCase() !== 'TRUE';
-}
-
-/**
- * Аренда: «кто сейчас копирует». Не атомарна (у Таблиц нет compare-and-set),
- * поэтому это лишь снижение вероятности гонки; от дублей защищает ключ строки.
- */
-function acquireLease_(ss) {
-  const current = getStatus_(ss, 'copy_lease');
-  if (current) {
-    const parts = current.split('|');
-    if (parts[0] !== LEASE_OWNER && Number(parts[1]) > Date.now()) return false;
-  }
-  setStatus_(ss, 'copy_lease', LEASE_OWNER + '|' + (Date.now() + LEASE_TTL_MS));
-  return true;
-}
-
-function releaseLease_(ss) {
-  setStatus_(ss, 'copy_lease', '');
+    : 'История защищена. Редактор: только владелец.');
 }
 
 /* ---------- Время ---------- */
 
+/** «Сегодня» по часовому поясу самой таблицы (Файл → Настройки). */
 function todayStr_(ss) {
-  const m = /^([+-])(\d{2}):(\d{2})$/.exec(getStatus_(ss, 'utc_offset'));
-  if (m) {
-    const minutes = (m[1] === '-' ? -1 : 1) * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
-    return Utilities.formatDate(new Date(Date.now() + minutes * 60000), 'UTC', 'yyyy-MM-dd');
-  }
-  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd');
 }
 
-function nowIso_() {
-  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ssXXX");
+function nowIso_(ss) {
+  return Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd'T'HH:mm:ssXXX");
 }
 
 /* ---------- Информация ---------- */
@@ -364,9 +407,17 @@ function nowIso_() {
 function showStatus() {
   const ss = SpreadsheetApp.getActive();
   const keys = ['installed_at', 'script_version', 'script_enabled', 'last_run',
-                'last_success', 'last_error', 'last_rows_copied', 'copy_lease',
-                'utc_offset', 'service_account_email'];
-  notify_(keys.map(k => k + ': ' + (getStatus_(ss, k) || '—')).join('\n'));
+                'last_success', 'last_error', 'last_rows_copied'];
+  const lines = keys.map(k => k + ': ' + (prop_(k) || '—'));
+  lines.push('timezone (настройки таблицы): ' + ss.getSpreadsheetTimeZone());
+  if (ss.getSheetByName(LEGACY_STATUS_SHEET)) {
+    lines.push('Найден лист ' + LEGACY_STATUS_SHEET + ' от старой версии: значения перенесены,\nно удалить лист автоматически не удалось (защита?). Удалите вручную.');
+  }
+  notify_(lines.join('\n'));
+}
+
+function isDisabled_() {
+  return prop_('script_enabled').trim().toUpperCase() !== 'TRUE';
 }
 
 function notify_(message) {

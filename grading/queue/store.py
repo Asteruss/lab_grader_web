@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Iterable
@@ -10,6 +12,8 @@ from gspread.exceptions import WorksheetNotFound
 
 from .errors import QueueError
 from .locks import locked_course
+
+logger = logging.getLogger(__name__)
 
 QUEUE_SHEET_PREFIX = "Очередь-"
 HISTORY_SHEET = "История_очереди"
@@ -20,6 +24,16 @@ HISTORY_HEADERS = ["Дата", "ПОЗИЦИЯ", "ГРУППА", "ФИО", "ЛР
 # Column letters in the daily queue sheet (1-based index into QUEUE_HEADERS).
 STATUS_COL = len(QUEUE_HEADERS)  # «Статус» is the last column
 STATUS_COL_LETTER = chr(ord("A") + STATUS_COL - 1)
+STATUS_COL_INDEX = STATUS_COL - 1  # 0-based, for Sheets API ranges
+
+# Дневной лист создаётся на QUEUE_SHEET_ROWS строк: диапазоны dropdown /
+# условного форматирования / фильтра задаются до этой строки (задача #19).
+QUEUE_SHEET_ROWS = 200
+
+# Колонка «ФИО» задана фиксированной шириной (автофита по содержимому в
+# Sheets API нет), хватает на полное имя и отчество.
+FIO_COL_INDEX = QUEUE_HEADERS.index("ФИО")
+FIO_COLUMN_WIDTH_PX = 240
 
 STATUS_WAITING = "ждёт"
 STATUS_PASSED = "сдал"
@@ -37,6 +51,38 @@ ACTIVE_STATUSES = {
     STATUS_WITHDRAWN,
 }
 ADMIN_STATUSES = {STATUS_PASSED, STATUS_FAILED, STATUS_ABSENT}
+
+# Статусы для dropdown на листе, порядок = порядок в выпадающем списке.
+# «вызван» (вызов следующего, PR #15) — преподаватель может выставить его
+# и руками в таблице.
+QUEUE_STATUS_CHOICES = [
+    STATUS_WAITING,
+    STATUS_CALLED,
+    STATUS_PASSED,
+    STATUS_FAILED,
+    STATUS_ABSENT,
+    STATUS_WITHDRAWN,
+]
+
+# Фон ячейки «Статус» по значению (условное форматирование, задача #19).
+# Значение без цвета остаётся без подсветки («ждёт» — дефолтный белый).
+STATUS_BG_COLORS = {
+    STATUS_CALLED: "#e8f0fe",
+    STATUS_PASSED: "#e6f4ea",
+    STATUS_FAILED: "#fce8e6",
+    STATUS_ABSENT: "#e8eaed",
+    STATUS_WITHDRAWN: "#fef7e0",
+}
+
+
+def _hex_to_rgb(hex_color: str) -> dict[str, float]:
+    """'#e6f4ea' -> {'red': 0.9, 'green': 0.95, 'blue': 0.91} (Sheets API)."""
+    value = hex_color.lstrip("#")
+    return {
+        "red": int(value[0:2], 16) / 255.0,
+        "green": int(value[2:4], 16) / 255.0,
+        "blue": int(value[4:6], 16) / 255.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -92,31 +138,6 @@ def _get_worksheet(spreadsheet, title: str):
         return None
 
 
-def _filter_view(title: str, sheet_id: int, criteria: dict[int, str]) -> dict:
-    return {
-        "addFilterView": {
-            "filter": {
-                "title": title,
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(QUEUE_HEADERS),
-                },
-                "criteria": {
-                    str(column): {
-                        "condition": {
-                            "type": "TEXT_EQ",
-                            "values": [{"userEnteredValue": value}],
-                        }
-                    }
-                    for column, value in criteria.items()
-                },
-            }
-        }
-    }
-
-
 def _setup_new_sheet(
     spreadsheet,
     worksheet,
@@ -145,32 +166,21 @@ def _setup_new_sheet(
     requests = [protected_range]
 
     if queue:
-        requests.append(
-            _filter_view("Все ждёт", worksheet.id, {7: STATUS_WAITING})
-        )
-        requests.append(
-            _filter_view("Сдано", worksheet.id, {7: STATUS_PASSED})
-        )
-        requests.append(
-            _filter_view("Не сдал", worksheet.id, {7: STATUS_FAILED})
-        )
         requests.append({
             "setDataValidation": {
                 "range": {
                     "sheetId": worksheet.id,
                     "startRowIndex": 1,
-                    "startColumnIndex": 7,
-                    "endColumnIndex": 8,
+                    "endRowIndex": QUEUE_SHEET_ROWS,
+                    "startColumnIndex": STATUS_COL_INDEX,
+                    "endColumnIndex": STATUS_COL_INDEX + 1,
                 },
                 "rule": {
                     "condition": {
                         "type": "ONE_OF_LIST",
                         "values": [
-                            {"userEnteredValue": STATUS_WAITING},
-                            {"userEnteredValue": STATUS_PASSED},
-                            {"userEnteredValue": STATUS_FAILED},
-                            {"userEnteredValue": STATUS_ABSENT},
-                            {"userEnteredValue": STATUS_WITHDRAWN},
+                            {"userEnteredValue": status}
+                            for status in QUEUE_STATUS_CHOICES
                         ],
                     },
                     "showCustomUi": True,
@@ -178,16 +188,94 @@ def _setup_new_sheet(
                 },
             }
         })
-        for group_id in sorted({str(g) for g in group_ids}):
-            requests.append(
-                _filter_view(f"Группа {group_id}", worksheet.id, {1: group_id})
-            )
-        for session_no in ["1", "2", "3", "4", "5", "6"]:
-            requests.append(
-                _filter_view(f"Пара {session_no}", worksheet.id, {4: session_no})
-            )
+        # Условное форматирование ячейки «Статус» (задача #19): по правилу на
+        # значение, диапазон до QUEUE_SHEET_ROWS. Только на клетку статуса,
+        # не на строку — по решению в задаче.
+        for status, color in STATUS_BG_COLORS.items():
+            requests.append({
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [{
+                            "sheetId": worksheet.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": QUEUE_SHEET_ROWS,
+                            "startColumnIndex": STATUS_COL_INDEX,
+                            "endColumnIndex": STATUS_COL_INDEX + 1,
+                        }],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "TEXT_EQ",
+                                "values": [{"userEnteredValue": status}],
+                            },
+                            "format": {"backgroundColor": _hex_to_rgb(color)},
+                        },
+                    },
+                    "index": 0,
+                }
+            })
+        # Ширина колонки «ФИО» — под полное имя (задача #19): автофита по
+        # содержимому в Sheets API нет, задаём фиксированную ширину.
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "dimension": "COLUMNS",
+                    "startColumnIndex": FIO_COL_INDEX,
+                    "endColumnIndex": FIO_COL_INDEX + 1,
+                },
+                "properties": {"pixelSize": FIO_COLUMN_WIDTH_PX},
+                "fields": "pixelSize",
+            }
+        })
+        # Автофильтр по заголовкам (не filter view — задача #19, п.3а): даёт
+        # сортировку/фильтр по любой колонке, в т.ч. по ЛР.
+        requests.append({
+            "setBasicFilter": {
+                "filter": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": QUEUE_SHEET_ROWS,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(QUEUE_HEADERS),
+                    }
+                }
+            }
+        })
 
     spreadsheet.batch_update({"requests": requests})
+
+    if queue:
+        # Лист как «Таблица» Google Sheets (задача #19, п.4). Не атомарно с
+        # основной настройкой: фича новая, у некоторых аккаунтов недоступна —
+        # её отказ не должен валить создание листа.
+        try:
+            spreadsheet.batch_update({"requests": [{
+                "addTable": {
+                    "table": {
+                        # имена таблиц не допускают спецсимволов (дефисов) —
+                        # заменяем на подчёркивания: «Очередь_2026_11_15»
+                        "name": worksheet.title.replace("-", "_"),
+                        "range": {
+                            "sheetId": worksheet.id,
+                            "startRowIndex": 0,
+                            "endRowIndex": QUEUE_SHEET_ROWS,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(QUEUE_HEADERS),
+                        },
+                        "columnProperties": [
+                            {"columnIndex": index, "columnName": header}
+                            for index, header in enumerate(QUEUE_HEADERS)
+                        ],
+                    }
+                }
+            }]})
+        except Exception as error:
+            logger.warning(
+                "addTable for %s failed (Sheets Tables may be unavailable): %s",
+                worksheet.title,
+                error,
+            )
 
 
 def _ensure_sheet(
@@ -206,7 +294,7 @@ def _ensure_sheet(
                 })
         worksheet = spreadsheet.add_worksheet(
             title=title,
-            rows=100,
+            rows=QUEUE_SHEET_ROWS,
             cols=len(headers),
         )
         _setup_new_sheet(spreadsheet, worksheet, headers, queue, group_ids)
