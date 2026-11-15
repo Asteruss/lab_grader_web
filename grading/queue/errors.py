@@ -25,14 +25,6 @@ ERROR_HTTP_STATUS = {
 }
 
 
-_STATUS_MAP: dict[str, int] = {
-    "SESSION_REQUIRED": 401, "ALREADY_IN_QUEUE": 409, "NOT_IN_QUEUE": 404,
-    "NOT_WAITING": 409, "INVALID_STATUS": 400, "INVALID_SHIFT": 400,
-    "CI_NOT_PASSED": 400, "CI_PENDING": 409, "ALREADY_PASSED": 400,
-    "NO_TEAM": 400, "QUEUE_CLOSED": 403,
-    "NO_WAITING": 409, "NOT_CALLED": 409,
-}
-
 class QueueError(Exception):
     def __init__(self, code: str, message: str = ""):
         self.code = code

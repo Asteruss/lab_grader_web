@@ -16,9 +16,7 @@ import {
 } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import {
-  extractSessionNo,
   fetchDefenseQueue,
-  fetchDefenseQueueStatus,
   registerAndCheck,
   registerForDefenseQueue,
   shiftDefenseQueue,
@@ -93,30 +91,21 @@ const entryMeta = (entry, t) => {
 // eslint-disable-next-line react/prop-types
 export function QueueSection({ courseId, groupId, labId, formData }) {
   const { t, i18n } = useTranslation();
-  const [status, setStatus] = useState(null);
-  const [queue, setQueue] = useState([]);
+  const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [shiftBy, setShiftBy] = useState("1");
 
-  // Число (примитив), а не объект сессии: эффект зависит только от sessionNo,
-  // иначе каждый reload создаёт новый объект status.session и зацикливает
-  // бесконечные запросы.
-  const sessionNo = useMemo(
-    () => extractSessionNo(status?.session),
-    [status?.session]
-  );
-
   // Guard against out-of-order responses: every load gets a sequence
   // number and a response that arrives after a newer request has started
   // (or after unmount) is discarded instead of overwriting fresh state.
-  // Without it a slow "Обновить" GET could arrive after "Записаться" and
-  // hide the entry that was just confirmed (review: stale reload).
   const requestSeq = useRef(0);
   const isMountedRef = useRef(false);
 
+  // П.14: один GET /queue возвращает и список, и персональное состояние
+  // (me) — отдельный GET /queue/status больше не нужен.
   const loadQueue = useCallback(
     async ({ showLoading = false } = {}) => {
       const seq = ++requestSeq.current;
@@ -125,17 +114,12 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
       }
       setError(null);
       try {
-        const [currentStatus, queueData] = await Promise.all([
-          fetchDefenseQueueStatus(courseId, groupId, labId, sessionNo),
-          fetchDefenseQueue(courseId, groupId, labId, sessionNo),
-        ]);
+        const resp = await fetchDefenseQueue(courseId, groupId, labId);
         if (seq !== requestSeq.current) return; // stale response - discard
-        setStatus(validateStatus(currentStatus));
-        setQueue(normalizeQueue(queueData));
+        setData(resp);
       } catch (requestError) {
         if (seq !== requestSeq.current) return; // stale failure - discard
-        setStatus(null);
-        setQueue([]);
+        setData(null);
         setError(requestError);
       } finally {
         if (seq === requestSeq.current && isMountedRef.current) {
@@ -143,11 +127,9 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
         }
       }
     },
-    [courseId, groupId, labId, sessionNo],
+    [courseId, groupId, labId]
   );
 
-  // Silent reload for post-mutation refreshes: the caller already shows
-  // feedback (notice), so no loading spinner is needed.
   const reload = useCallback(() => loadQueue({ showLoading: false }), [loadQueue]);
 
   useEffect(() => {
@@ -161,12 +143,45 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
     loadQueue({ showLoading: true });
   }, [loadQueue]);
 
+  // П.14: поллинг 15 c, пауза на скрытой вкладке, обновление при возврате.
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      if (!document.hidden) {
+        loadQueue();
+      }
+    }, 15000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        loadQueue();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [loadQueue]);
+
+  // Производные состояния из одного ответа /queue (П.14).
+  const me = data?.me ?? null;
+  const sessionRequired = me === null;
+  const inQueue = me?.in_queue === true;
+  const called = me?.called === true;
+  const position = me?.position ?? null;
+  const alreadyPassed = false; // проверяется при регистрации (register -> ALREADY_PASSED)
+  const session = data?.session ?? null;
+  const nextSession = data?.next_session ?? null;
+  const queueOpen = data?.queue_open === true;
+  const queueRows = useMemo(() => data?.queue ?? [], [data]);
+  const teamLab = data?.is_team_lab === true;
+  const team = data?.team ?? null;
+
   const handleJoinQueue = async () => {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      if (status?.session_required && formData) {
+      if (sessionRequired && formData) {
         await registerAndCheck(courseId, groupId, formData);
       }
       await registerForDefenseQueue(courseId, groupId, labId);
@@ -210,12 +225,12 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
   };
 
   const nextSessionLabel = useMemo(
-    () => sessionLabel(status?.next_session, i18n.language, t),
-    [i18n.language, status?.next_session, t]
+    () => sessionLabel(nextSession, i18n.language, t),
+    [i18n.language, nextSession, t]
   );
   const currentSessionLabel = useMemo(
-    () => sessionLabel(status?.session, i18n.language, t),
-    [i18n.language, status?.session, t]
+    () => sessionLabel(session, i18n.language, t),
+    [i18n.language, session, t]
   );
 
   const errorMessage = error
@@ -226,7 +241,6 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
       : error.message || t("queue.errors.generic")
     : null;
 
-  const team = status?.team;
   const teamMembers = Array.isArray(team?.members) ? team.members : [];
   const validShift = /^[1-9]\d*$/.test(shiftBy) && Number.isSafeInteger(Number(shiftBy));
   const formReady = formData && formData.surname && formData.name && formData.github;
@@ -253,7 +267,7 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
 
         {!loading && (
           <>
-            {status?.is_team_lab && team && (
+            {teamLab && team && (
               <Paper variant="outlined" sx={{ p: 2 }}>
                 <Typography variant="subtitle2">{t("queue.teamTitle")}</Typography>
                 <Typography>{team.title || team.name || team.slug}</Typography>
@@ -273,46 +287,38 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
               </Paper>
             )}
 
-            {status && status.already_passed && (
-              <Alert severity="success">{t("queue.alreadyPassed")}</Alert>
-            )}
-
-            {status && status.in_queue && status.called && (
+            {inQueue && called && (
               <Alert severity="info">{t("queue.calledBanner")}</Alert>
             )}
 
-            {status && status.in_queue && !status.called && (
+            {inQueue && !called && (
               <Alert severity="success">
                 {t("queue.position", {
-                  position: status.position,
-                  total: status.queue_size,
+                  position: position,
+                  total: me?.queue_size ?? position,
                 })}
               </Alert>
             )}
 
-            {status && !status.in_queue && !status.already_passed && status.queue_open === false && (
+            {!inQueue && !called && !queueOpen && (
               <Alert severity="warning">
                 {t("queue.closed", { nextSession: nextSessionLabel })}
               </Alert>
             )}
 
-            {status && !status.in_queue && !status.already_passed && status.queue_open !== false && (
+            {!inQueue && !called && queueOpen && (
               <Button
                 variant="contained"
                 color="primary"
                 size="large"
-                disabled={
-                  busy ||
-                  !formReady ||
-                  (!status.session_required && status.can_register !== true)
-                }
+                disabled={busy || !formReady}
                 onClick={handleJoinQueue}
               >
                 {t(busy ? "queue.working" : "queue.register")}
               </Button>
             )}
 
-            {status && status.in_queue && !status.called && (
+            {inQueue && !called && (
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems="flex-start">
                 <Button
                   variant="outlined"
@@ -344,7 +350,7 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
               </Stack>
             )}
 
-            {status?.session && (
+            {session && (
               <Typography variant="body2" color="text.secondary">
                 {t("queue.session")}: {currentSessionLabel}
               </Typography>
@@ -363,19 +369,19 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
                   {t("queue.refresh")}
                 </Button>
               </Stack>
-              {queue.length === 0 ? (
+              {queueRows.length === 0 ? (
                 <Typography variant="body2" color="text.secondary">
                   {t("queue.empty")}
                 </Typography>
               ) : (
                 <List disablePadding>
-                  {queue.map((entry, index) => {
+                  {queueRows.map((entry, index) => {
                     const isCalled = entry.status === STATUS_CALLED;
                     const position = entry.position ?? (isCalled ? "—" : index + 1);
                     return (
                       <ListItem
                         key={`${entry.fio}-${entry.lab}-${index}`}
-                        divider={index < queue.length - 1}
+                        divider={index < queueRows.length - 1}
                         disableGutters
                         sx={
                           STATUS_BG[entry.status]

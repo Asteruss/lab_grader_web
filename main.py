@@ -16,6 +16,7 @@ import json
 import base64
 import logging
 import threading
+import time
 from datetime import datetime
 from urllib.parse import quote, urlencode
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -91,9 +92,9 @@ from grading.schedule import (
 from grading.queue.errors import QueueError
 from grading.queue.locks import locked_course
 from grading.queue.cache import (
-    get_queue as _get_queue_cache,
-    invalidate_queue as _invalidate_queue_cache,
-    invalidate_course as _invalidate_course_queue_cache,
+    get_queue as _cache_get_queue,
+    get_queue_locked as _cache_get_queue_locked,
+    invalidate_queue as _cache_invalidate_queue,
 )
 from grading.queue.store import (
     QUEUE_SHEET_PREFIX,
@@ -119,7 +120,6 @@ from grading.queue.store import (
     set_status as _queue_set_status,
     call_next as _queue_call_next,
     uncall as _queue_uncall,
-    list_today as _queue_list_today,
     find_past_queue_sheets,
     snapshot_sheet,
     maybe_snapshot_past_days,
@@ -203,12 +203,29 @@ SHEETS_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis
 SHEETS_TIMEOUT_SECONDS = 30
 
 
+_sheets_client_lock = threading.Lock()
+_sheets_client_instance: gspread.Client | None = None
+
+
 def sheets_client() -> gspread.Client:
-    """Authorized gspread client with a request timeout set."""
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, SHEETS_SCOPE)
-    client = gspread.authorize(creds)
-    client.set_timeout(SHEETS_TIMEOUT_SECONDS)
-    return client
+    """Authorized gspread client, созданный один раз (план оптимизации, П.2).
+
+    Service account credentials живут долго; gspread сам обновляет access
+    token, поэтому пересоздавать клиента (file I/O + RSA-подпись) на каждый
+    запрос не нужно.
+    """
+    global _sheets_client_instance
+    if _sheets_client_instance is not None:
+        return _sheets_client_instance
+    with _sheets_client_lock:
+        if _sheets_client_instance is None:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(
+                CREDENTIALS_FILE, SHEETS_SCOPE
+            )
+            client = gspread.authorize(creds)
+            client.set_timeout(SHEETS_TIMEOUT_SECONDS)
+            _sheets_client_instance = client
+    return _sheets_client_instance
 
 
 def _start_background_job(func, *args, name: str) -> None:
@@ -3036,26 +3053,78 @@ def _open_spreadsheet(course_info: dict):
         raise HTTPException(status_code=503, detail="Google Sheets недоступен")
 
 
+# --- Кэши queue-эндпоинтов (план оптимизации, П.2/П.5/П.8) ---
+# _aux_cache сбрасывается нагрузочным стендом (patch_main) перед прогонами.
+_aux_cache: dict = {}
+_aux_lock = threading.Lock()
+_SS_TTL_SECONDS = 60.0
+
+# П.5: snapshot / ensure-today выполняются один раз в день на курс
+# (course_id -> last processed date ISO). Ключ слетает в полночь сам.
+_queue_ready_done: dict[str, str] = {}
+_ready_lock = threading.Lock()
+
+_SS_ERR_503 = HTTPException(status_code=503, detail="Google Sheets недоступен")
+
+
+def _get_spreadsheet(course_info: dict):
+    """Spreadsheet-объект курса с кэшем 60 c (план оптимизации, П.8).
+
+    gspread Spreadsheet — тонкая обёртка над HTTP: переиспользование
+    безопасно, каждый вызов метода делает свежий запрос к API.
+    """
+    spreadsheet_id = course_info.get("google", {}).get("spreadsheet")
+    if not spreadsheet_id:
+        raise HTTPException(status_code=400, detail="Spreadsheet ID not found in course config")
+
+    key = ("ss", spreadsheet_id)
+    entry = _aux_cache.get(key)
+    if entry is not None and time.monotonic() - entry[0] < _SS_TTL_SECONDS:
+        return entry[1]
+
+    client = sheets_client()
+    try:
+        ss = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        logger.error(f"Failed to open spreadsheet: {e}")
+        raise HTTPException(status_code=503, detail="Google Sheets недоступен") from e
+
+    with _aux_lock:
+        _aux_cache[key] = (time.monotonic(), ss)
+    return ss
+
+
 def _ensure_queue_ready(spreadsheet, course_info: dict, course_id: str) -> str:
-    """Run lazy snapshot, create today's sheet, return today_str."""
+    """Run lazy snapshot and create today's sheet — один раз в день (П.5).
+
+    Последующие запросы дня проходят по fast path (ни одного вызова
+    gspread). Флаг слетает сам в полночь (значение != today_str).
+    Инвалидация кэша строк здесь НЕ выполняется — только после реальных
+    мутаций (П.1): иначе кэш не работает вовсе.
+    """
     today_str = _queue_today_str(course_info)
+    if _queue_ready_done.get(course_id) == today_str:
+        return today_str
+
     from datetime import date
     today = date.fromisoformat(today_str)
 
-    # Lazy snapshot: move past-day sheets to history, delete them
-    try:
-        moved = maybe_snapshot_past_days(spreadsheet, today)
-        if moved:
-            logger.info(f"Queue snapshot moved {moved} rows to history for course {course_id}")
-    except Exception as e:
-        logger.exception(f"Queue snapshot failed for course {course_id}: {e}")
+    with _ready_lock:
+        if _queue_ready_done.get(course_id) != today_str:
+            try:
+                moved = maybe_snapshot_past_days(spreadsheet, today)
+                if moved:
+                    logger.info(f"Queue snapshot moved {moved} rows to history for course {course_id}")
+            except Exception as e:
+                logger.exception(f"Queue snapshot failed for course {course_id}: {e}")
 
-    # Invalidate cache after snapshot
-    _invalidate_course_queue_cache(spreadsheet.id, course_id)
-
-    # Ensure today's sheet exists
-    group_ids = _schedule_group_ids(course_id)
-    ensure_today_sheet(spreadsheet, today, group_ids)
+            try:
+                group_ids = _schedule_group_ids(course_id)
+                ensure_today_sheet(spreadsheet, today, group_ids)
+                _queue_ready_done[course_id] = today_str
+            except Exception:
+                # ensure не удался — следующий запрос попробует снова
+                raise
 
     return today_str
 
@@ -3131,9 +3200,12 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         # the day's queue outlives the session window. Read today's sheet
         # if it exists; never create it here.
         try:
-            spreadsheet = _open_spreadsheet(course_info)
+            spreadsheet = _get_spreadsheet(course_info)
             today_str = _queue_today_str(course_info)
-            _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+            rows = _cache_get_queue(
+                spreadsheet.id, today_str,
+                lambda: _read_today_queue_if_exists(spreadsheet, today_str)[1],
+            )
         except Exception as e:
             # A storage read failure must not break the "closed" view.
             logger.warning(f"queue_status: cannot read today's queue outside session: {e}")
@@ -3184,12 +3256,14 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "session_required": session_required,
         }
 
-    # Session is active - create the sheet and get queue size
-    spreadsheet = _open_spreadsheet(course_info)
+    # Session is active - ensure today's sheet (once/day) and read cached rows
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    rows = read_queue_rows(worksheet)
+    rows = _cache_get_queue(
+        spreadsheet.id, today_str,
+        lambda: read_queue_rows(spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")),
+    )
     lab_short_name = lab_config.get("short-name", lab_key)
     # One pair = one queue (issue #62 review): scope by (group, pair) of the
     # active session; the lab column is only a label of what is defended.
@@ -3282,44 +3356,16 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         else None
     )
 
-    # Check ALREADY_PASSED
-    history_ws = None
-    try:
-        history_ws = ensure_history_sheet(spreadsheet)
-    except Exception:
-        pass
+    # П.6: status read-only — already_passed/ci_status вычисляет POST
+    # /register (реальная проверка), здесь без обращений к Sheets/GitHub.
     already_passed = False
-    if history_ws and fio:
-        already_passed = find_in_history(history_ws, group_id, fio, lab_short_name, STATUS_PASSED)
-
-    # Check CI status from grade cell
     ci_status = "unknown"
-    try:
-        if not is_team_lab(lab_config):
-            ctx = _load_queue_sheet_context(
-                sheets_client, course_info, group_id, lab_config, username
-            )
-            cell = (ctx.current_cell_value or "").strip()
-            if cell.lower().startswith("vv"):
-                ci_status = "passed"
-                already_passed = True
-            elif cell.startswith("v"):
-                ci_status = "passed"
-            elif cell == "x" or cell == "":
-                ci_status = "not_run"
-            else:
-                ci_status = "unknown"
-    except QueueError:
-        ci_status = "unknown"
 
     queue_open = session is not None
     team_lab = is_team_lab(lab_config)
     can_register = (
-        not already_passed
-        and entry is None
+        entry is None
         and called_entry is None
-        # Team CI is checked against the shared repo by the registration endpoint.
-        and (team_lab or ci_status in ("passed", "not_run"))
         and queue_open
     )
 
@@ -3354,7 +3400,7 @@ def _session_dict(session) -> dict | None:
 # --- Register ---
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/register")
-@limiter.limit("10/minute")
+@limiter.limit("30/minute")
 def queue_register(request: Request, course_id: str, group_id: str, lab_id: str):
     """Register the authenticated student in the defense queue."""
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
@@ -3365,11 +3411,19 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
         raise HTTPException(status_code=403, detail="QUEUE_CLOSED")
 
     username, _fio = _require_student_session(request, course_id, group_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     # Resolve identifier and FIO
     team_repo_name = None
+    # П.10/П.11: контекст загружается один раз и переиспользуется в
+    # ensure_ci_passed (второй вызов loader'а = лишний get_all_values
+    # листа группы). Для командных лаб loader ленивый — вызывается
+    # внутри ensure_ci_passed, когда команда уже известна.
+    ctx_loader = lambda: _load_queue_sheet_context(
+        sheets_client, course_info, group_id, lab_config, username,
+        spreadsheet=spreadsheet,
+    )
     try:
         if is_team_lab(lab_config):
             team_result = _resolve_queue_team(
@@ -3381,9 +3435,7 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
             identifier = team_result.title
             team_repo_name = team_result.repo_name
         else:
-            ctx = _load_queue_sheet_context(
-                sheets_client, course_info, group_id, lab_config, username
-            )
+            ctx = ctx_loader()
             fio = ctx.fio
             identifier = fio
     except QueueError as e:
@@ -3407,9 +3459,7 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
             username=username,
             lab_config=lab_config,
             course_info=course_info,
-            context_loader=lambda: _load_queue_sheet_context(
-                sheets_client, course_info, group_id, lab_config, username
-            ),
+            context_loader=ctx_loader,
             repo_name=team_repo_name,
             history_worksheet=history_ws,
             group=group_id,
@@ -3424,6 +3474,15 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     today = date.fromisoformat(today_str)
     group_ids = _schedule_group_ids(course_id)
     signup_time = _queue_now_str(course_info)
+    pre_rows = _cache_get_queue(
+        spreadsheet.id, today_str,
+        lambda: read_queue_rows(spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")),
+    )
+    scoped_count = len([
+        r for r in pre_rows
+        if r.group == group_id
+        and (session_no is None or r.session_no in (None, session_no))
+    ])
     try:
         position = _queue_register(
             spreadsheet, today, group_id, fio, lab_short_name, session_no, group_ids,
@@ -3433,27 +3492,20 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
-
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    # One pair = one queue: the size is the pair queue length, not the lab's.
-    scoped = [
-        r for r in read_queue_rows(worksheet)
-        if r.group == group_id
-        and (session_no is None or r.session_no in (None, session_no))
-    ]
-
-    return {"position": position, "queue_size": len(scoped)}
+    # П.11: кэш НЕ инвалидируется — store.register обновил его in-place
+    # (append_row_to_cache), наблюдатели и следующие записи видят строку
+    # без перечитывания листа.
+    return {"position": position, "queue_size": scoped_count + 1}
 
 
 # --- Withdraw ---
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/withdraw")
-@limiter.limit("10/minute")
+@limiter.limit("5/minute")
 def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str):
     """Withdraw the authenticated student from the queue."""
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
     username, _fio = _require_student_session(request, course_id, group_id)
 
@@ -3486,14 +3538,14 @@ def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"status": "withdrawn"}
 
 
 # --- Shift ---
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/shift")
-@limiter.limit("10/minute")
+@limiter.limit("5/minute")
 def queue_shift(
     request: Request,
     course_id: str,
@@ -3503,7 +3555,7 @@ def queue_shift(
 ):
     """Shift the authenticated student backward in the queue."""
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
     username, _fio = _require_student_session(request, course_id, group_id)
 
@@ -3535,7 +3587,7 @@ def queue_shift(
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"old_position": old_pos, "new_position": new_pos}
 
 
@@ -3571,14 +3623,6 @@ def _read_today_queue_if_exists(spreadsheet, today_str: str):
     return worksheet, read_queue_rows(worksheet)
 
 
-def _view_rank(row) -> int:
-    if row.status == STATUS_CALLED:
-        return 0
-    if row.status == STATUS_WAITING:
-        return 1
-    return 2
-
-
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue")
 @limiter.limit("30/minute")
 def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
@@ -3592,9 +3636,12 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
         # stay visible until they are served — the day's queue outlives the
         # session window. Read the sheet if it exists; never create it here.
         try:
-            spreadsheet = _open_spreadsheet(course_info)
+            spreadsheet = _get_spreadsheet(course_info)
             today_str = _queue_today_str(course_info)
-            _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
+            rows = _cache_get_queue(
+                spreadsheet.id, today_str,
+                lambda: _read_today_queue_if_exists(spreadsheet, today_str)[1],
+            )
         except Exception as e:
             # A storage read failure must not break the "closed" view.
             logger.warning(f"queue_list: cannot read today's queue outside session: {e}")
@@ -3626,16 +3673,22 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
             "size": len(filtered_rows),
             "is_team_lab": is_team_lab(lab_config),
             "queue_open": False,
+            "session": None,
+            "next_session": _session_dict(_queue_next_session(course_id, group_id, lab_key)),
         }
 
     # Get session_no from query params (optional)
     session_no = _get_session_no_from_request(request)
 
-    spreadsheet = _open_spreadsheet(course_info)
+    next_sess = _queue_next_session(course_id, group_id, lab_key)
+
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    rows = read_queue_rows(worksheet)
+    rows = _cache_get_queue(
+        spreadsheet.id, today_str,
+        lambda: read_queue_rows(spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")),
+    )
 
     # One pair = one queue (issue #62 review): scope by (group, pair);
     # the lab column is only a label and stays in the payload.
@@ -3645,7 +3698,31 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
         and (session_no is None or r.session_no in (None, session_no))
     ]
     filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
+
+    # П.14: персональное состояние запрашивающего студента — из кэша,
+    # без отдельного GET /queue/status.
+    student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
+    student = parse_student_session(signer, student_cookie)
+    me = None
+    if (student is not None
+            and student.get("course_id") == course_id
+            and student.get("group_id") == group_id):
+        github = student.get("github", "")
+        fio = student.get("fio", "")
+        if fio:
+            entry = find_waiting(rows, group_id, fio, github=github)
+            called_entry = (
+                find_called(rows, group_id, fio, github=github)
+                if entry is None else None
+            )
+            me = {
+                "in_queue": entry is not None or called_entry is not None,
+                "position": entry.position if entry else None,
+                "called": called_entry is not None,
+                "queue_size": len(filtered_rows),
+            }
     return {
+        "me": me,
         "queue": [
             {
                 "position": r.position,
@@ -3676,7 +3753,7 @@ def admin_queue_today(
 ):
     admin = _ensure_admin_resolved(request, admin)
     course_info = get_course_by_id(course_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _queue_today_str(course_info)
 
     _ws, rows = _read_today_queue_if_exists(spreadsheet, today_str)
@@ -3737,7 +3814,7 @@ def queue_set_status(
     """Mark a student's or team's queue entry with a defense result."""
     admin = _ensure_admin_resolved(request, admin)
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     from datetime import date
@@ -3752,7 +3829,7 @@ def queue_set_status(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"status": "updated", "new_status": body.status}
 
 
@@ -3777,7 +3854,7 @@ def queue_call(
     """
     admin = _ensure_admin_resolved(request, admin)
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     from datetime import date
@@ -3793,7 +3870,7 @@ def queue_call(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {
         "called": {
             "fio": called.fio,
@@ -3821,7 +3898,7 @@ def queue_uncall(
         raise HTTPException(status_code=422, detail="identifier required")
 
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
     from datetime import date
@@ -3836,7 +3913,7 @@ def queue_uncall(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"status": "returned"}
 
 
@@ -3853,7 +3930,7 @@ def queue_snapshot(
     admin = _ensure_admin_resolved(request, admin)
 
     course_info = get_course_by_id(course_id)
-    spreadsheet = _open_spreadsheet(course_info)
+    spreadsheet = _get_spreadsheet(course_info)
 
     today_str = _queue_today_str(course_info)
     from datetime import date
@@ -3865,7 +3942,7 @@ def queue_snapshot(
         logger.exception(f"Manual snapshot failed for course {course_id}: {e}")
         raise HTTPException(status_code=500, detail="Не удалось выполнить snapshot")
 
-    _invalidate_course_queue_cache(spreadsheet.id, course_id)
+    _cache_invalidate_queue(spreadsheet.id, today_str)
     return {"moved_rows": moved}
 
 # --- OAuth callback extension: handle purpose="queue" ---

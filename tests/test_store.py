@@ -118,6 +118,8 @@ class FakeSpreadsheet:
 @pytest.fixture(autouse=True)
 def reset_state():
     reset_locks()
+    from grading.queue.cache import reset_queue_cache
+    reset_queue_cache()
 
 
 def _add_queue(spreadsheet, entries, title="Очередь-2026-11-08"):

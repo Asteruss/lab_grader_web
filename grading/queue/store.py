@@ -6,11 +6,13 @@ import logging
 
 from dataclasses import dataclass
 from datetime import date
+import time
 from typing import Any, Iterable
 
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError, WorksheetNotFound
 
 from .errors import QueueError
+from . import cache
 from .locks import locked_course
 
 logger = logging.getLogger(__name__)
@@ -278,6 +280,21 @@ def _setup_new_sheet(
             )
 
 
+# Кэш worksheet-объектов + валидации заголовков (план оптимизации, П.8/П.9).
+# Ключ по id(spreadsheet): у нагрузочного стенда и прод-объектов разные
+# инстансы — ключ не переживает пересоздание объекта. TTL 60 c ограничивает
+# стухание при внешнем удалении/пересоздании листа.
+_ws_cache: dict[tuple[int, str], tuple[float, object]] = {}
+_validated_headers: dict[tuple[int, str], float] = {}
+_WS_TTL_SECONDS = 60.0
+
+
+def reset_ws_cache() -> None:
+    """Сброс worksheet-кэша и валидации заголовков (тесты/смена окружения)."""
+    _ws_cache.clear()
+    _validated_headers.clear()
+
+
 def _ensure_sheet(
     spreadsheet,
     title: str,
@@ -285,6 +302,30 @@ def _ensure_sheet(
     queue: bool,
     group_ids: Iterable[str] = (),
 ):
+    key = (id(spreadsheet), title)
+    now = time.monotonic()
+
+    entry = _ws_cache.get(key)
+    if entry is not None and now - entry[0] < _WS_TTL_SECONDS:
+        worksheet = entry[1]
+        validated_at = _validated_headers.get(key)
+        if validated_at is not None and now - validated_at < _WS_TTL_SECONDS:
+            return worksheet
+        try:
+            actual_headers = worksheet.row_values(1)
+        except APIError:
+            # лист удалён/пересоздан извне — сброс и пересоздание
+            _ws_cache.pop(key, None)
+            _validated_headers.pop(key, None)
+            return _ensure_sheet(spreadsheet, title, headers, queue, group_ids)
+        if actual_headers[: len(headers)] != headers or len(actual_headers) > len(headers):
+            raise QueueError(
+                "SHEETS_SCHEMA_MISMATCH",
+                f"Неверные заголовки листа {title!r}: ожидаются {headers!r}",
+            )
+        _validated_headers[key] = now
+        return worksheet
+
     worksheet = _get_worksheet(spreadsheet, title)
     if worksheet is None:
         for ws in spreadsheet.worksheets():
@@ -298,14 +339,16 @@ def _ensure_sheet(
             cols=len(headers),
         )
         _setup_new_sheet(spreadsheet, worksheet, headers, queue, group_ids)
-        return worksheet
+    else:
+        actual_headers = worksheet.row_values(1)
+        if actual_headers[: len(headers)] != headers or len(actual_headers) > len(headers):
+            raise QueueError(
+                "SHEETS_SCHEMA_MISMATCH",
+                f"Неверные заголовки листа {title!r}: ожидаются {headers!r}",
+            )
 
-    actual_headers = worksheet.row_values(1)
-    if actual_headers[: len(headers)] != headers or len(actual_headers) > len(headers):
-        raise QueueError(
-            "SHEETS_SCHEMA_MISMATCH",
-            f"Неверные заголовки листа {title!r}: ожидаются {headers!r}",
-        )
+    _ws_cache[key] = (now, worksheet)
+    _validated_headers[key] = now
     return worksheet
 
 
@@ -475,7 +518,9 @@ def find_in_history(
     status: str,
 ) -> bool:
     """Whether *(group, fio, lab, status)* already exists in the history sheet."""
-    values = history_worksheet.get_all_values()
+    values = cache.get_history_values(
+        history_worksheet, history_worksheet.get_all_values
+    )
     return any(
         len(row) >= len(HISTORY_HEADERS)
         and row[2].strip() == group
@@ -524,7 +569,10 @@ def register(
     """Append a waiting row and return its 1-based position."""
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        rows = read_queue_rows(worksheet)
+        rows = cache.get_queue_locked(
+            spreadsheet.id, today.isoformat(),
+            lambda: read_queue_rows(worksheet),
+        )
         # A student has at most one active entry per day, across all labs
         # and sessions: they cannot defend two labs at once. "вызван" counts
         # as active — the teacher has called them, the defense has not ended.
@@ -560,6 +608,17 @@ def register(
             value_input_option="RAW",
             table_range="A1:H",
         )
+        # П.11: кэш обновляется in-place — следующий регистр/просмотр видит
+        # запись без перечитывания листа.
+        new_row_index = max((r.row_index for r in rows), default=1) + 1
+        cache.append_row_to_cache(
+            spreadsheet.id, today.isoformat(),
+            QueueRow(
+                position=position, group=group, fio=fio, lab=lab,
+                session_no=session_no, status=STATUS_WAITING,
+                row_index=new_row_index, github=github, signup_time=signup_time,
+            ),
+        )
         return position
 
 
@@ -574,7 +633,10 @@ def withdraw(
 ) -> None:
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        rows = read_queue_rows(worksheet)
+        rows = cache.get_queue_locked(
+            spreadsheet.id, today.isoformat(),
+            lambda: read_queue_rows(worksheet),
+        )
         matching = [
             row
             for row in rows
@@ -596,6 +658,7 @@ def withdraw(
             worksheet,
             [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WITHDRAWN]]}],
         )
+        cache.invalidate_queue(spreadsheet.id, today.isoformat())
 
 
 def shift_down(
@@ -624,7 +687,10 @@ def shift_down(
 
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        rows = read_queue_rows(worksheet)
+        rows = cache.get_queue_locked(
+            spreadsheet.id, today.isoformat(),
+            lambda: read_queue_rows(worksheet),
+        )
         waiting = list_waiting(rows, group, session_no)
         row = _unique_row(waiting, group, fio, session_no, github=github)
         if session_no is None and row.session_no is not None:
@@ -645,6 +711,7 @@ def shift_down(
             for entry, ticket in zip(rotated, tickets)
         ]
         _write_cells(worksheet, updates)
+        cache.invalidate_queue(spreadsheet.id, today.isoformat())
         return current_index + 1, new_index + 1
 
 
@@ -662,7 +729,10 @@ def set_status(
 
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        rows = read_queue_rows(worksheet)
+        rows = cache.get_queue_locked(
+            spreadsheet.id, today.isoformat(),
+            lambda: read_queue_rows(worksheet),
+        )
         matching = [
             row
             for row in rows
@@ -689,6 +759,7 @@ def set_status(
             worksheet,
             [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[status]]}],
         )
+        cache.invalidate_queue(spreadsheet.id, today.isoformat())
 
 
 def call_next(
@@ -711,7 +782,10 @@ def call_next(
     """
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        rows = read_queue_rows(worksheet)
+        rows = cache.get_queue_locked(
+            spreadsheet.id, today.isoformat(),
+            lambda: read_queue_rows(worksheet),
+        )
         waiting = list_waiting(rows, group, session_no)
         if fio is None:
             if not waiting:
@@ -725,6 +799,7 @@ def call_next(
                 {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_CALLED]]},
             ],
         )
+        cache.invalidate_queue(spreadsheet.id, today.isoformat())
         return QueueRow(
             position=row.position,
             group=row.group,
@@ -747,7 +822,10 @@ def uncall(
     """Return a called entry back to the waiting queue, at the end."""
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        rows = read_queue_rows(worksheet)
+        rows = cache.get_queue_locked(
+            spreadsheet.id, today.isoformat(),
+            lambda: read_queue_rows(worksheet),
+        )
         matching = [
             row
             for row in rows
@@ -779,6 +857,7 @@ def uncall(
                 {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WAITING]]},
             ],
         )
+        cache.invalidate_queue(spreadsheet.id, today.isoformat())
 
 
 
@@ -906,6 +985,7 @@ def snapshot_sheet(spreadsheet, sheet_name: str) -> int:
             )
         requests.append({"deleteSheet": {"sheetId": worksheet.id}})
         spreadsheet.batch_update({"requests": requests})
+        cache.invalidate_history(history)
         return len(new_rows)
 
 def maybe_snapshot_past_days(spreadsheet, today: date) -> int:

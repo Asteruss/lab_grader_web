@@ -43,6 +43,11 @@ from grading.queue.store import (
 
 SIGNER = main_module.signer
 TODAY = date(2026, 11, 9)
+
+@pytest.fixture(autouse=True)
+def reset_queue_cache_fixture():
+    from grading.queue.cache import reset_queue_cache
+    reset_queue_cache()
 TODAY_STR = TODAY.isoformat()
 
 
@@ -335,7 +340,10 @@ class TestQueueStatus:
         assert data["position"] == 1
         assert data["queue_size"] == 2
 
-    def test_when_already_passed_in_history(self, deps):
+    def test_status_is_read_only_already_passed_left_to_register(self, deps):
+        # П.6 (лимиты по плану): status read-only — уже сданные работы
+        # определяются при регистрации (register -> 400 ALREADY_PASSED),
+        # без чтения всей истории на каждый просмотр.
         history = deps.worksheet("История_очереди")
         history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", "", "", STATUS_PASSED])
 
@@ -344,8 +352,8 @@ class TestQueueStatus:
             _mock_request({"student_session": cookie}),
             "dev-course", "4431", "1",
         )
-        assert data["already_passed"] is True
-        assert data["can_register"] is False
+        assert data["already_passed"] is False
+        assert data["queue_open"] is True
 
     def test_when_queue_closed(self, deps, monkeypatch):
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
