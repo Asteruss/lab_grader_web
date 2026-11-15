@@ -275,7 +275,13 @@
       "loadFailed": "Failed to load queue"
     },
     "buttonToday": "今日队列",
-    "titleToday": "{{date}} 的队列"
+    "titleToday": "{{date}} 的队列",
+    "calledTitle": "当前已叫号",
+    "callNext": "叫下一位",
+    "call": "叫号",
+    "returnToQueue": "返回队列",
+    "actions": "操作",
+    "pair": "第 {{no}} 节课"
   },
   "queue": {
     "title": "实验答辩排队",
@@ -295,6 +301,7 @@
     "registered": "您已加入队列。",
     "withdraw": "退出队列",
     "withdrawn": "您已退出队列。",
+    "calledBanner": "老师已叫到您 —— 请准备答辩。",
     "shiftBy": "向后移动位数",
     "shift": "向后移动",
     "shifted": "您的队列位置已更新。",
@@ -315,6 +322,7 @@
       "не_сдал": "未通过",
       "нет": "缺席",
       "отозван": "已退出",
+      "вызван": "已叫号",
       "waiting": "等待中",
       "passed": "已通过",
       "failed": "未通过",

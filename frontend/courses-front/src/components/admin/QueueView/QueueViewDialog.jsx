@@ -27,6 +27,7 @@ const STATUS_COLOR = {
   "не_сдал": "error",
   "нет": "warning",
   "отозван": "default",
+  "вызван": "secondary",
 };
 
 /**

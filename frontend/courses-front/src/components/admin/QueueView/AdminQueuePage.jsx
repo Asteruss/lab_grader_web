@@ -1,12 +1,14 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   Alert,
+  Box,
   Button,
   Chip,
   Container,
   CircularProgress,
+  Paper,
   Stack,
   Table,
   TableHead,
@@ -18,12 +20,16 @@ import {
   Typography,
 } from "@mui/material";
 
+const STATUS_CALLED = "вызван";
+const STATUS_WAITING = "ждёт";
+
 const STATUS_COLOR = {
   "ждёт": "info",
   "сдал": "success",
   "не_сдал": "error",
   "нет": "warning",
   "отозван": "default",
+  "вызван": "secondary",
 };
 
 function ArrowBackIcon() {
@@ -50,6 +56,7 @@ export const AdminQueuePage = () => {
   const [queue, setQueue] = useState([]);
   const [date, setDate] = useState("");
   const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
   const loadQueue = useCallback(async () => {
@@ -78,6 +85,88 @@ export const AdminQueuePage = () => {
   useEffect(() => {
     loadQueue();
   }, [loadQueue]);
+
+  // Admin action: POST to a queue admin endpoint, then reload the list.
+  // Parallel calls are allowed: each call marks the first waiting entry
+  // ("вызван") without touching previously called ones, so the teacher
+  // can call the next participant before finishing the previous defense.
+  const postAction = useCallback(
+    async (path, body) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const resp = await fetch(
+          `/api/v1/admin/courses/${encodeURIComponent(courseId)}${path}`,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }
+        );
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          throw new Error(
+            typeof data.detail === "string" ? data.detail : `HTTP ${resp.status}`
+          );
+        }
+        await loadQueue();
+      } catch (err) {
+        setError(err.message || t("adminQueue.errors.loadFailed"));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [courseId, loadQueue, t]
+  );
+
+  const scopePath = (scope) =>
+    `/groups/${encodeURIComponent(scope.group)}/labs/${encodeURIComponent(scope.lab)}`;
+
+  const callNext = useCallback(
+    (scope) => postAction(`${scopePath(scope)}/queue/call`, {}),
+    [postAction]
+  );
+
+  const callEntry = useCallback(
+    (entry) =>
+      postAction(`${scopePath(entry)}/queue/call`, { identifier: entry.fio }),
+    [postAction]
+  );
+
+  const uncallEntry = useCallback(
+    (entry) =>
+      postAction(`${scopePath(entry)}/queue/uncall`, { identifier: entry.fio }),
+    [postAction]
+  );
+
+  const finishDefense = useCallback(
+    (entry, status) =>
+      postAction(`${scopePath(entry)}/queue/set-status`, {
+        identifier: entry.fio,
+        status,
+      }),
+    [postAction]
+  );
+
+  const called = queue.filter((entry) => entry.status === STATUS_CALLED);
+
+  // One pair = one queue (issue #62 review): scope sections by (group, pair),
+  // not by lab. The lab of the first entry is only used to build the API path.
+  const scopes = useMemo(() => {
+    const seen = new Map();
+    for (const entry of queue) {
+      const key = `${entry.group}\u0000${entry.session_no ?? ""}`;
+      if (!seen.has(key)) {
+        seen.set(key, {
+          group: entry.group,
+          session_no: entry.session_no ?? null,
+          lab: entry.lab,
+        });
+      }
+    }
+    return [...seen.values()];
+  }, [queue]);
 
   return (
     <Container maxWidth="xl">
@@ -117,38 +206,141 @@ export const AdminQueuePage = () => {
       ) : queue.length === 0 ? (
         <Alert severity="info">{t("adminQueue.empty")}</Alert>
       ) : (
-        <Table size="small">
-          <TableHead>
-            <TableRow>
-              <TableCell>{t("adminQueue.columns.position")}</TableCell>
-              <TableCell>{t("adminQueue.columns.group")}</TableCell>
-              <TableCell>{t("adminQueue.columns.name")}</TableCell>
-              <TableCell>{t("adminQueue.columns.lab")}</TableCell>
-              <TableCell>{t("adminQueue.columns.github")}</TableCell>
-              <TableCell>{t("adminQueue.columns.time")}</TableCell>
-              <TableCell>{t("adminQueue.columns.status")}</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {queue.map((entry, index) => (
-              <TableRow key={`${entry.fio}-${entry.lab}-${index}`}>
-                <TableCell>{entry.position ?? index + 1}</TableCell>
-                <TableCell>{entry.group}</TableCell>
-                <TableCell>{entry.fio}</TableCell>
-                <TableCell>{entry.lab}</TableCell>
-                <TableCell>{entry.github || "—"}</TableCell>
-                <TableCell>{entry.signup_time || "—"}</TableCell>
-                <TableCell>
-                  <Chip
-                    size="small"
-                    color={STATUS_COLOR[entry.status] || "default"}
-                    label={t(`queue.statuses.${entry.status}`, { defaultValue: entry.status })}
-                  />
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <>
+          {called.length > 0 && (
+            <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+              <Typography variant="subtitle1" sx={{ mb: 1 }}>
+                {t("adminQueue.calledTitle")}
+              </Typography>
+              <Stack spacing={1}>
+                {called.map((entry, index) => (
+                  <Stack
+                    key={`${entry.fio}-${entry.lab}-${index}`}
+                    direction={{ xs: "column", sm: "row" }}
+                    spacing={1}
+                    alignItems={{ sm: "center" }}
+                    justifyContent="space-between"
+                    sx={{ flexWrap: "wrap" }}
+                  >
+                    <Typography>
+                      {entry.fio} · {entry.group} · {entry.lab}
+                    </Typography>
+                    <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        color="success"
+                        disabled={busy}
+                        onClick={() => finishDefense(entry, "сдал")}
+                      >
+                        {t("queue.statuses.сдал")}
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="error"
+                        disabled={busy}
+                        onClick={() => finishDefense(entry, "не_сдал")}
+                      >
+                        {t("queue.statuses.не_сдал")}
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="warning"
+                        disabled={busy}
+                        onClick={() => finishDefense(entry, "нет")}
+                      >
+                        {t("queue.statuses.нет")}
+                      </Button>
+                      <Button
+                        size="small"
+                        disabled={busy}
+                        onClick={() => uncallEntry(entry)}
+                      >
+                        {t("adminQueue.returnToQueue")}
+                      </Button>
+                    </Stack>
+                  </Stack>
+                ))}
+              </Stack>
+            </Paper>
+          )}
+
+          {scopes.map((scope) => {
+            const entries = queue.filter(
+              (e) =>
+                e.group === scope.group &&
+                (e.session_no ?? null) === scope.session_no
+            );
+            const hasWaiting = entries.some((e) => e.status === STATUS_WAITING);
+            return (
+              <Box key={`${scope.group}-${scope.session_no ?? "x"}`} sx={{ mb: 3 }}>
+                <Stack
+                  direction="row"
+                  justifyContent="space-between"
+                  alignItems="center"
+                  sx={{ mb: 1, flexWrap: "wrap" }}
+                >
+                  <Typography variant="subtitle1">
+                    {scope.group} · {t("adminQueue.pair", { no: scope.session_no ?? "—" })}
+                  </Typography>
+                  <Button
+                    variant="contained"
+                    disabled={busy || !hasWaiting}
+                    onClick={() => callNext(scope)}
+                  >
+                    {t("adminQueue.callNext")}
+                  </Button>
+                </Stack>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>{t("adminQueue.columns.position")}</TableCell>
+                      <TableCell>{t("adminQueue.columns.group")}</TableCell>
+                      <TableCell>{t("adminQueue.columns.name")}</TableCell>
+                      <TableCell>{t("adminQueue.columns.lab")}</TableCell>
+                      <TableCell>{t("adminQueue.columns.github")}</TableCell>
+                      <TableCell>{t("adminQueue.columns.time")}</TableCell>
+                      <TableCell>{t("adminQueue.columns.status")}</TableCell>
+                      <TableCell>{t("adminQueue.actions")}</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {entries.map((entry, index) => (
+                      <TableRow key={`${entry.fio}-${entry.lab}-${index}`}>
+                        <TableCell>{entry.position ?? "—"}</TableCell>
+                        <TableCell>{entry.group}</TableCell>
+                        <TableCell>{entry.fio}</TableCell>
+                        <TableCell>{entry.lab}</TableCell>
+                        <TableCell>{entry.github || "—"}</TableCell>
+                        <TableCell>{entry.signup_time || "—"}</TableCell>
+                        <TableCell>
+                          <Chip
+                            size="small"
+                            color={STATUS_COLOR[entry.status] || "default"}
+                            label={t(`queue.statuses.${entry.status}`, { defaultValue: entry.status })}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          {entry.status === STATUS_WAITING && (
+                            <Button
+                              size="small"
+                              disabled={busy}
+                              onClick={() => callEntry(entry)}
+                            >
+                              {t("adminQueue.call")}
+                            </Button>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </Box>
+            );
+          })}
+        </>
       )}
     </Container>
   );

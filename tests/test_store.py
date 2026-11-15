@@ -13,6 +13,7 @@ from grading.queue.store import (
     STATUS_PASSED,
     STATUS_WAITING,
     STATUS_WITHDRAWN,
+    STATUS_CALLED,
     ensure_history_sheet,
     ensure_today_sheet,
     find_in_history,
@@ -23,6 +24,8 @@ from grading.queue.store import (
     shift_down,
     snapshot_sheet,
     withdraw,
+    call_next,
+    uncall,
 )
 from grading.queue.locks import reset_locks
 
@@ -150,6 +153,56 @@ def test_register_appends_waiting_row_and_blocks_duplicate_waiting_fio():
     assert sheet.row_values(2) == ["1", "4431", "Иванов Иван", "ЛР1", "", "ivanov", "10:30", STATUS_WAITING]
 
 
+def test_register_numbers_the_pair_queue_across_labs():
+    """Issue #62 review: одна пара = одна очередь.
+
+    Лаба — только метка (что сдаёт участник); нумерация общая по
+    (группа, пара), записи разных лаб не имеют отдельных очередей.
+    Разные пары нумеруются независимо, каждая с 1.
+    """
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+
+    # Пара 2: Новиков (ЛР2), следом Морозова (ЛР1) — сквозная нумерация пары.
+    assert register(spreadsheet, today, "4431", "Новиков", "ЛР2", session_no=2) == 1
+    assert register(spreadsheet, today, "4431", "Морозова", "ЛР1", session_no=2) == 2
+    # Пара 1 нумеруется независимо, снова с 1.
+    assert register(spreadsheet, today, "4431", "Сидорова", "ЛР1", session_no=1) == 1
+
+    sheet = spreadsheet.sheets["Очередь-2026-11-08"]
+    rows = read_queue_rows(sheet)
+    assert [(row.fio, row.lab, row.session_no, row.position) for row in rows] == [
+        ("Новиков", "ЛР2", 2, 1),
+        ("Морозова", "ЛР1", 2, 2),
+        ("Сидорова", "ЛР1", 1, 1),
+    ]
+
+
+def test_call_next_is_pair_scoped_not_lab_scoped():
+    """Вызов «следующего» идёт по очереди пары, лаба записи не важна."""
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+    sheet = _add_queue(
+        spreadsheet,
+        [
+            ("4431", "Новиков", "ЛР2", STATUS_WAITING, 1),
+            ("4431", "Морозова", "ЛР1", STATUS_WAITING, 2),
+        ],
+    )
+
+    called = call_next(spreadsheet, today, "4431")
+    assert called.fio == "Новиков"
+
+    set_status(spreadsheet, today, "4431", "Новиков", STATUS_PASSED)
+    called = call_next(spreadsheet, today, "4431")
+    assert called.fio == "Морозова"
+
+    rows = read_queue_rows(sheet)
+    statuses = {row.fio: (row.position, row.status) for row in rows}
+    assert statuses["Новиков"] == (1, STATUS_PASSED)
+    assert statuses["Морозова"] == (2, STATUS_CALLED)
+
+
 def test_shift_down_only_for_waiting_entries_and_clamps_at_end():
     spreadsheet = FakeSpreadsheet()
     sheet = _add_queue(
@@ -161,21 +214,51 @@ def test_shift_down_only_for_waiting_entries_and_clamps_at_end():
         ],
     )
 
-    assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1", 1) == (1, 2)
+    assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 1) == (1, 2)
     rows = read_queue_rows(sheet)
     assert [(row.fio, row.position) for row in rows] == [
         ("Иванов", 2),
         ("Петров", 1),
         ("Сидоров", 3),
     ]
-    assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1", 99) == (2, 3)
+    assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 99) == (2, 3)
     with pytest.raises(QueueError, match="INVALID_SHIFT"):
-        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1", 1)
+        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 1)
     with pytest.raises(QueueError, match="INVALID_SHIFT"):
-        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1", 0)
+        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 0)
 
 
-def test_withdraw_and_set_status_leave_history_rows_and_renumber_waiting():
+def test_shift_down_rotates_tickets_within_segment_only():
+    """Сдвиг переставляет билеты только внутри задетого сегмента ждущих:
+    вызванные/завершённые строки сохраняют свои номера, дублей не возникает,
+    дырки от отозванных не схлопываются."""
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+    sheet = _add_queue(
+        spreadsheet,
+        [
+            ("4431", "Иванов", "ЛР1", STATUS_CALLED, 1),
+            ("4431", "Петров", "ЛР1", STATUS_WAITING, 2),
+            ("4431", "Сидоров", "ЛР1", STATUS_WAITING, 3),
+            ("4431", "Кузнецов", "ЛР1", STATUS_WAITING, 5),  # дырка: №4 отозван
+        ],
+    )
+
+    old, new = shift_down(spreadsheet, today, "4431", "Петров", 2)
+    assert (old, new) == (1, 3)
+
+    rows = read_queue_rows(sheet)
+    # В листе порядок строк не меняется; очередь (по билетам):
+    # Иванов(1, вызван) -> Сидоров(2) -> Кузнецов(3) -> Петров(5).
+    assert [(row.fio, row.position, row.status) for row in rows] == [
+        ("Иванов", 1, STATUS_CALLED),      # билет вызванного не тронут
+        ("Петров", 5, STATUS_WAITING),     # взял последний билет сегмента
+        ("Сидоров", 2, STATUS_WAITING),    # занял билет Петрова
+        ("Кузнецов", 3, STATUS_WAITING),   # занял билет Сидорова
+    ]
+
+
+def test_withdraw_and_set_status_preserve_positions():
     spreadsheet = FakeSpreadsheet()
     sheet = _add_queue(
         spreadsheet,
@@ -186,17 +269,17 @@ def test_withdraw_and_set_status_leave_history_rows_and_renumber_waiting():
         ],
     )
 
-    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1")
-    set_status(spreadsheet, date(2026, 11, 8), "4431", "Петров", "ЛР1", STATUS_PASSED)
+    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов")
+    set_status(spreadsheet, date(2026, 11, 8), "4431", "Петров", STATUS_PASSED)
     rows = read_queue_rows(sheet)
 
+    # Позиции — билеты: ничто не перенумеровывается автоматически,
+    # меняются только явными действиями (запись, возврат в конец, сдвиг).
     assert [(row.fio, row.position, row.status) for row in rows] == [
         ("Иванов", 1, STATUS_WITHDRAWN),
-        ("Петров", 1, STATUS_PASSED),
-        ("Сидоров", 1, STATUS_WAITING),
+        ("Петров", 2, STATUS_PASSED),
+        ("Сидоров", 3, STATUS_WAITING),
     ]
-    assert rows[0].position == 1
-    assert rows[1].position == 1
 
 
 def test_status_validation_and_waiting_only_transitions():
@@ -204,9 +287,9 @@ def test_status_validation_and_waiting_only_transitions():
     _add_queue(spreadsheet, [("4431", "Иванов", "ЛР1", STATUS_ABSENT, 1)])
 
     with pytest.raises(QueueError, match="NOT_WAITING"):
-        set_status(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1", STATUS_FAILED)
+        set_status(spreadsheet, date(2026, 11, 8), "4431", "Иванов", STATUS_FAILED)
     with pytest.raises(QueueError, match="INVALID_STATUS"):
-        set_status(spreadsheet, date(2026, 11, 8), "4431", "Иванов", "ЛР1", STATUS_WAITING)
+        set_status(spreadsheet, date(2026, 11, 8), "4431", "Иванов", STATUS_WAITING)
 
 
 def test_snapshot_writes_history_and_deletes_daily_tab_atomically():
@@ -233,6 +316,62 @@ def test_snapshot_writes_history_and_deletes_daily_tab_atomically():
     assert append_rows[0]["values"][8]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
     assert append_rows[1]["values"][8]["userEnteredValue"]["stringValue"] == STATUS_FAILED
     assert history.row_values(1) == HISTORY_HEADERS
+
+
+def test_snapshot_maps_called_entry_to_not_reached():
+    spreadsheet = FakeSpreadsheet()
+    active = _add_queue(
+        spreadsheet,
+        [
+            ("4431", "Иванов", "ЛР1", STATUS_CALLED, 1),
+            ("4431", "Петров", "ЛР1", STATUS_WAITING, 2),
+        ],
+    )
+    active.title = "Очередь-2026-11-07"
+    spreadsheet.sheets = {active.title: active}
+    ensure_history_sheet(spreadsheet)
+    spreadsheet.metadata_requests.clear()
+
+    assert snapshot_sheet(spreadsheet, active.title) == 2
+    append_rows = spreadsheet.metadata_requests[0]["appendCells"]["rows"]
+    # И ждущий, и вызванный без результата к концу дня — "не дошёл".
+    assert append_rows[0]["values"][-1]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
+    assert append_rows[1]["values"][-1]["userEnteredValue"]["stringValue"] == STATUS_NOT_REACHED
+
+
+def test_call_next_and_uncall_keep_single_active_entry():
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+    sheet = _add_queue(
+        spreadsheet,
+        [
+            ("4431", "Иванов", "ЛР1", STATUS_WAITING, 1),
+            ("4431", "Петров", "ЛР1", STATUS_WAITING, 2),
+            ("4431", "Сидоров", "ЛР1", STATUS_WAITING, 3),
+        ],
+    )
+
+    called = call_next(spreadsheet, today, "4431")
+    assert called.fio == "Иванов"
+
+    rows = read_queue_rows(sheet)
+    statuses = {row.fio: (row.position, row.status) for row in rows}
+    # Позиции — билеты: вызванный и ждущие свои номера не меняют.
+    assert statuses["Иванов"] == (1, STATUS_CALLED)
+    assert statuses["Петров"] == (2, STATUS_WAITING)
+    assert statuses["Сидоров"] == (3, STATUS_WAITING)
+
+    # Повторная запись вызванным запрещена: одна активная запись на день.
+    with pytest.raises(QueueError, match="ALREADY_IN_QUEUE"):
+        register(spreadsheet, today, "4431", "Иванов", "ЛР1")
+
+    uncall(spreadsheet, today, "4431", "Иванов")
+    rows = read_queue_rows(sheet)
+    statuses = {row.fio: (row.position, row.status) for row in rows}
+    # Возврат в конец очереди — новый билет max+1; остальные не тронуты.
+    assert statuses["Иванов"] == (4, STATUS_WAITING)
+    assert statuses["Петров"] == (2, STATUS_WAITING)
+    assert statuses["Сидоров"] == (3, STATUS_WAITING)
 
 
 def test_snapshot_is_idempotent_and_skips_already_moved_rows():
@@ -344,16 +483,16 @@ def test_withdraw_and_shift_match_by_github_not_fio_for_same_name_students():
 
     # Same FIO, different GitHub login: withdraw and shift must NOT match A's row.
     with pytest.raises(QueueError, match="NOT_IN_QUEUE"):
-        withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+        withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван",
                  github="c06-ivanov-b")
     with pytest.raises(QueueError, match="NOT_IN_QUEUE"):
-        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1", 1,
+        shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", 1,
                    github="c06-ivanov-b")
 
     # A different FIO still matches only its own row (control).
     register(spreadsheet, date(2026, 11, 8), "4431", "Петрова Анна", "ЛР1",
              github="c06-petrova", signup_time="10:05")
-    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Петрова Анна", "ЛР1",
+    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Петрова Анна",
              github="c06-petrova")
 
     rows = read_queue_rows(sheet)
@@ -364,7 +503,7 @@ def test_withdraw_and_shift_match_by_github_not_fio_for_same_name_students():
     assert petrova.status == STATUS_WITHDRAWN
 
     # The owner can still withdraw their own entry (github match).
-    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
+    withdraw(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван",
              github="c06-ivanov-a")
     rows = read_queue_rows(sheet)
     ivanov = [row for row in rows if row.fio == "Иванов Иван"][0]
