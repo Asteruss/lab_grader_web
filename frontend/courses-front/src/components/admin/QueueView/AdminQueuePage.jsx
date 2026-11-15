@@ -19,6 +19,7 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
+import { fetchGroups, fetchQueueState, openQueue, closeQueue, autoQueue } from "../../../api";
 
 const STATUS_CALLED = "вызван";
 const STATUS_WAITING = "ждёт";
@@ -58,6 +59,11 @@ export const AdminQueuePage = () => {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  // Manual queue override (issue #10): per-group open/close/auto state.
+  const [groups, setGroups] = useState([]);
+  const [overrideMap, setOverrideMap] = useState({});
+  const [overrideBusy, setOverrideBusy] = useState(false);
+  const [overrideError, setOverrideError] = useState(null);
 
   const loadQueue = useCallback(async () => {
     setLoading(true);
@@ -149,6 +155,67 @@ export const AdminQueuePage = () => {
     [postAction]
   );
 
+  // --- Manual queue override (issue #10): per-group open/close/auto ---
+  // The panel lists every group of the course (fetchGroups), not just those
+  // with queue entries, so the teacher can open an unscheduled session even
+  // when the queue is empty. fetchQueueState returns only groups with an
+  // active override; groups absent from it are "auto" (schedule decides).
+  const loadGroups = useCallback(() => {
+    fetchGroups(courseId)
+      .then((data) => setGroups(Array.isArray(data) ? data : []))
+      .catch(() => setGroups([]));
+  }, [courseId]);
+
+  const loadOverrideState = useCallback(async () => {
+    try {
+      const data = await fetchQueueState(courseId);
+      const map = {};
+      for (const g of data?.groups || []) map[g.group] = g;
+      setOverrideMap(map);
+    } catch (err) {
+      // Non-fatal: the panel falls back to "auto" for every group.
+      setOverrideError(
+        err.code === "SESSION_REQUIRED"
+          ? t("adminQueue.errors.authRequired", { defaultValue: "Требуется вход администратора" })
+          : err.message || t("adminQueue.errors.loadFailed")
+      );
+    }
+  }, [courseId, t]);
+
+  useEffect(() => {
+    loadGroups();
+  }, [loadGroups]);
+
+  useEffect(() => {
+    loadOverrideState();
+  }, [loadOverrideState]);
+
+  const postOverride = useCallback(
+    async (groupId, action) => {
+      setOverrideBusy(true);
+      setOverrideError(null);
+      try {
+        if (action === "open") await openQueue(courseId, groupId);
+        else if (action === "close") await closeQueue(courseId, groupId);
+        else if (action === "auto") await autoQueue(courseId, groupId);
+        await loadOverrideState();
+        // An openness change affects the queue view too: the closed branch
+        // stops creating today's sheet, the open branch starts it. Reload so
+        // the teacher sees the new state right away.
+        await loadQueue();
+      } catch (err) {
+        setOverrideError(
+          err.code === "SESSION_REQUIRED"
+            ? t("adminQueue.errors.authRequired", { defaultValue: "Требуется вход администратора" })
+            : err.message || t("adminQueue.errors.loadFailed")
+        );
+      } finally {
+        setOverrideBusy(false);
+      }
+    },
+    [courseId, loadOverrideState, loadQueue, t]
+  );
+
   const called = queue.filter((entry) => entry.status === STATUS_CALLED);
 
   // One pair = one queue (issue #62 review): scope sections by (group, pair),
@@ -191,6 +258,87 @@ export const AdminQueuePage = () => {
           {t("adminQueue.refresh")}
         </Button>
       </Stack>
+
+      <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+        <Typography variant="subtitle1" sx={{ mb: 1 }}>
+          {t("adminQueue.manage.title", { defaultValue: "Управление записью" })}
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          {t("adminQueue.manage.hint", {
+            defaultValue:
+              "Открыть запись на внештатное занятие или досрочно закрыть её, не удаляя ожидающих. Действует до конца дня, затем — снова по расписанию.",
+          })}
+        </Typography>
+        {overrideError && (
+          <Alert
+            severity="error"
+            onClose={() => setOverrideError(null)}
+            sx={{ mb: 2 }}
+          >
+            {overrideError}
+          </Alert>
+        )}
+        {groups.length === 0 ? (
+          <Typography color="text.secondary">
+            {t("adminQueue.manage.noGroups", { defaultValue: "Нет групп" })}
+          </Typography>
+        ) : (
+          <Stack spacing={1}>
+            {groups.map((g) => {
+              const st = overrideMap[g]?.state || "auto";
+              const chipColor =
+                st === "open" ? "success" : st === "closed" ? "error" : "default";
+              const chipLabel = t(`adminQueue.manage.state.${st}`, {
+                defaultValue:
+                  st === "open" ? "Открыто" : st === "closed" ? "Закрыто" : "Авто",
+              });
+              return (
+                <Stack
+                  key={g}
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  alignItems={{ sm: "center" }}
+                  justifyContent="space-between"
+                  sx={{ flexWrap: "wrap" }}
+                >
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Typography>{g}</Typography>
+                    <Chip size="small" color={chipColor} label={chipLabel} />
+                  </Stack>
+                  <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      color="success"
+                      disabled={overrideBusy || st === "open"}
+                      onClick={() => postOverride(g, "open")}
+                    >
+                      {t("adminQueue.manage.open", { defaultValue: "Открыть" })}
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="error"
+                      disabled={overrideBusy || st === "closed"}
+                      onClick={() => postOverride(g, "close")}
+                    >
+                      {t("adminQueue.manage.close", { defaultValue: "Закрыть" })}
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={overrideBusy || st === "auto"}
+                      onClick={() => postOverride(g, "auto")}
+                    >
+                      {t("adminQueue.manage.auto", { defaultValue: "Авто" })}
+                    </Button>
+                  </Stack>
+                </Stack>
+              );
+            })}
+          </Stack>
+        )}
+      </Paper>
 
       {error && (
         <Alert severity="error" onClose={() => setError(null)} sx={{ mb: 2 }}>

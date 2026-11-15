@@ -129,7 +129,10 @@ from grading.queue.store import (
 from grading.queue.ci import ensure_ci_passed
 from grading.queue.sheets_context import load_sheet_context as _load_queue_sheet_context
 from grading.queue.schedule_window import (
-    active_session_for as _queue_active_session,
+    # Renamed: ``_queue_active_session`` is now the override-aware wrapper
+    # defined below (issue #10 / ADR p.4). The raw schedule lookup is reached
+    # only in "auto" mode (no manual override).
+    active_session_for as _active_session_for_schedule,
     next_session_for as _queue_next_session,
     session_no_from_slot,
 )
@@ -901,6 +904,11 @@ def edit_course_put(request: Request, course_id: str, data: EditCourseRequest, a
 
 
 def _is_group_sheet_title(title: str, info_sheet: str | list[str] | None) -> bool:
+    # Sheets the queue system creates itself are never groups, regardless of
+    # the config: daily queue sheets ("Очередь-<дата>", also manual ones like
+    # "Очередь-test-format") and the history sheet (issue #62 review).
+    if title.startswith(QUEUE_SHEET_PREFIX) or title == HISTORY_SHEET:
+        return False
     if isinstance(info_sheet, list):
         return not title.startswith(tuple(info_sheet))
     return title != info_sheet and re.fullmatch(r"\d+", title) is not None
@@ -3175,6 +3183,145 @@ def queue_login(request: Request, course_id: str, group_id: str, lab_id: str):
     )
 
 
+# --- Manual queue override (issue #10 / ADR p.4) ---------------------------
+#
+# A teacher may open an unscheduled session ("внештатное занятие") or stop new
+# registrations early on an active one, while keeping already-waiting students
+# visible. The override is per (course, group), lives in memory, and expires at
+# the start of the next local day -- it never survives past "today"; for a
+# recurring change, edit the schedule (corrections) instead. Only admins
+# (require_admin) can set it; students never reach these endpoints.
+
+from dataclasses import dataclass
+
+
+def _parse_course_tz(tz_str: str):
+    """Course timezone as a tzinfo (UTC+offset or IANA), falling back to UTC.
+
+    Same parsing as ``_queue_today_str`` / ``_queue_now_str`` but factored out so
+    the override logic can compute the local day boundary without duplicating the
+    UTC(+/-)H regex.
+    """
+    from datetime import timezone, timedelta
+    match = re.fullmatch(r"UTC([+-])(\d{1,2})", tz_str or "")
+    if match:
+        sign = 1 if match.group(1) == "+" else -1
+        return timezone(sign * timedelta(hours=int(match.group(2))))
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo(tz_str)
+    except (KeyError, ValueError, TypeError):
+        return timezone.utc
+
+
+@dataclass(frozen=True)
+class _QueueOverride:
+    state: str            # "open" | "closed"
+    set_at: datetime      # aware
+    valid_until: datetime  # aware -- start of the next local day
+    by: str               # admin login who set it
+
+
+# (course_id, group_id) -> override. In-memory only; cleared on process restart
+# and at the start of the next local day (lazy expiry on read).
+_QUEUE_OVERRIDE: dict[tuple[str, str], "_QueueOverride"] = {}
+_QUEUE_OVERRIDE_LOCK = threading.Lock()
+
+
+def _queue_override_valid_until(course_info: dict) -> datetime:
+    """Aware datetime marking the start of tomorrow in the course timezone."""
+    from datetime import time, timedelta
+    tz = _parse_course_tz(course_info.get("timezone", "UTC+3"))
+    return datetime.combine(datetime.now(tz).date(), time.min, tzinfo=tz) + timedelta(days=1)
+
+
+def _queue_get_override(course_id: str, group_id: str) -> str | None:
+    """Active override state for the group, or None when auto/expired.
+
+    None -> let the schedule decide; "open" -> force a synthetic session;
+    "closed" -> force None (registration blocked, waiting students stay
+    visible via the closed branch of queue_status / queue_list). Expired
+    entries are dropped lazily on read so the store never leaks across days.
+    """
+    with _QUEUE_OVERRIDE_LOCK:
+        ov = _QUEUE_OVERRIDE.get((course_id, group_id))
+        if ov is None:
+            return None
+        if datetime.now(ov.valid_until.tzinfo) >= ov.valid_until:
+            _QUEUE_OVERRIDE.pop((course_id, group_id), None)
+            return None
+        return ov.state
+
+
+def _queue_set_override(course_id: str, group_id: str, state: str, by: str, course_info: dict) -> None:
+    """Set or replace the override; valid until the start of the next local day."""
+    valid_until = _queue_override_valid_until(course_info)
+    with _QUEUE_OVERRIDE_LOCK:
+        _QUEUE_OVERRIDE[(course_id, group_id)] = _QueueOverride(
+            state=state,
+            set_at=datetime.now(valid_until.tzinfo),
+            valid_until=valid_until,
+            by=by,
+        )
+
+
+def _queue_clear_override(course_id: str, group_id: str) -> None:
+    """Remove the override; openness follows the schedule again."""
+    with _QUEUE_OVERRIDE_LOCK:
+        _QUEUE_OVERRIDE.pop((course_id, group_id), None)
+
+
+@dataclass(frozen=True)
+class _ManualOpenSession:
+    """Synthetic session for a teacher-opened queue.
+
+    Duck-type compatible with what ``queue_status`` / ``queue_register`` /
+    ``_session_dict`` read (slot_id, starts_at, ends_at, room, subject). The
+    slot_id has no digits, so ``session_no_from_slot`` -> 0: every student of
+    the group lands in one shared queue for the day, exactly like daily mode.
+    ``allows_lab`` is included for duck-type safety even though the wrapper
+    returns this session directly, bypassing the active-window filter.
+    """
+    slot_id: str
+    subject: str
+    starts_at: datetime
+    ends_at: datetime
+    room: str
+
+    def allows_lab(self, lab_key: str) -> bool:
+        return True
+
+
+def _queue_manual_session(course_info: dict) -> _ManualOpenSession:
+    """Build the synthetic 'open' session: today 00:00-24:00 in the course tz."""
+    from datetime import time, timedelta
+    tz = _parse_course_tz(course_info.get("timezone", "UTC+3"))
+    day_start = datetime.combine(datetime.now(tz).date(), time.min, tzinfo=tz)
+    return _ManualOpenSession(
+        slot_id="manual",
+        subject="",
+        starts_at=day_start,
+        ends_at=day_start + timedelta(days=1),
+        room="",
+    )
+
+
+def _queue_active_session(course_id: str, group_id: str, lab_key: str):
+    """Resolve the active queue session, honouring a teacher's manual override.
+
+    open   -> synthetic whole-day session (registration allowed, session_no=0).
+    closed -> None (registration blocked; waiting students stay visible via the
+              closed branch of queue_status / queue_list).
+    auto   -> delegate to the schedule (active_session_for).
+    """
+    state = _queue_get_override(course_id, group_id)
+    if state == "open":
+        return _queue_manual_session(get_course_by_id(course_id) or {})
+    if state == "closed":
+        return None
+    return _active_session_for_schedule(course_id, group_id, lab_key)
+
+
 # --- Status ---
 
 @app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/status")
@@ -3917,6 +4064,109 @@ def queue_uncall(
     return {"status": "returned"}
 
 
+# --- Admin: manual queue open/close override (issue #10 / ADR p.4) ----------
+#
+# Per (course, group). open -> synthetic session (register allowed); close ->
+# block new registrations but keep waiting students visible; auto -> remove the
+# override and follow the schedule again. All three expire at the start of the
+# next local day. Only admins reach these routes (require_admin).
+
+
+@app.post("/admin/courses/{course_id}/groups/{group_id}/queue/open")
+@limiter.limit("30/minute")
+def queue_open(
+    request: Request,
+    course_id: str,
+    group_id: str,
+    admin: str = Depends(require_admin),
+):
+    """Open registration for the group now (external / unscheduled session).
+
+    Overrides the schedule for the rest of the local day: ``queue_status`` will
+    report ``queue_open=true`` with a synthetic ``slot_id="manual"`` session
+    (session_no=0 -> one shared queue for the group), and ``queue_register``
+    will succeed instead of 403 QUEUE_CLOSED.
+    """
+    admin = _ensure_admin_resolved(request, admin)
+    course_info = get_course_by_id(course_id)
+    if not course_info:
+        raise HTTPException(status_code=404, detail="Course not found")
+    _queue_set_override(course_id, group_id, "open", admin, course_info)
+    return {"course_id": course_id, "group": group_id, "state": "open", "by": admin}
+
+
+@app.post("/admin/courses/{course_id}/groups/{group_id}/queue/close")
+@limiter.limit("30/minute")
+def queue_close(
+    request: Request,
+    course_id: str,
+    group_id: str,
+    admin: str = Depends(require_admin),
+):
+    """Stop new registrations for the group now (waiting students stay visible).
+
+    Forces ``_queue_active_session`` to None even on an active pair, so
+    ``queue_register`` returns 403 QUEUE_CLOSED while ``queue_status`` still
+    reads today's sheet and shows the waiting entries (the closed branch keeps
+    them visible until they are served).
+    """
+    admin = _ensure_admin_resolved(request, admin)
+    course_info = get_course_by_id(course_id)
+    if not course_info:
+        raise HTTPException(status_code=404, detail="Course not found")
+    _queue_set_override(course_id, group_id, "closed", admin, course_info)
+    return {"course_id": course_id, "group": group_id, "state": "closed", "by": admin}
+
+
+@app.post("/admin/courses/{course_id}/groups/{group_id}/queue/auto")
+@limiter.limit("30/minute")
+def queue_auto(
+    request: Request,
+    course_id: str,
+    group_id: str,
+    admin: str = Depends(require_admin),
+):
+    """Remove the manual override; openness follows the schedule again."""
+    admin = _ensure_admin_resolved(request, admin)
+    _queue_clear_override(course_id, group_id)
+    return {"course_id": course_id, "group": group_id, "state": "auto", "by": admin}
+
+
+@app.get("/admin/courses/{course_id}/queue/state")
+@limiter.limit("30/minute")
+def queue_state(
+    request: Request,
+    course_id: str,
+    admin: str = Depends(require_admin),
+):
+    """Per-group override state for the queue-management panel.
+
+    Returns only groups that currently have an override; groups absent from the
+    list are in "auto" (the schedule decides). The frontend merges this with its
+    own full group list (fetchGroups) so the panel can render a row and an
+    "Open/Close/Auto" control for every group, even when no override is set.
+    """
+    admin = _ensure_admin_resolved(request, admin)
+    from datetime import timezone
+    now_utc = datetime.now(timezone.utc)
+    groups = []
+    with _QUEUE_OVERRIDE_LOCK:
+        items = [
+            (key, ov) for key, ov in _QUEUE_OVERRIDE.items()
+            if key[0] == course_id
+        ]
+    for (_cid, group_id), ov in items:
+        valid = ov.valid_until.astimezone(timezone.utc) > now_utc
+        groups.append({
+            "group": group_id,
+            "state": ov.state if valid else "auto",
+            "set_at": ov.set_at.isoformat(),
+            "valid_until": ov.valid_until.isoformat(),
+            "by": ov.by,
+        })
+    return {"course_id": course_id, "groups": groups}
+
+
 # --- Admin: manual snapshot ---
 
 @app.post("/admin/courses/{course_id}/queue/snapshot")
@@ -4041,10 +4291,10 @@ def _validate_schedule_yaml(new_data: dict, course_id: str, old_data: dict | Non
 
     if isinstance(groups, dict):
         for configured_id, group_config in groups.items():
-            if not str(configured_id).isdigit():
+            if not str(configured_id).strip():
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Идентификатор группы {configured_id!r} должен содержать только цифры",
+                    detail="Идентификатор группы должен быть непустым",
                 )
             if not isinstance(group_config, dict):
                 raise HTTPException(

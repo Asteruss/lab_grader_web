@@ -135,6 +135,38 @@ export const shiftDefenseQueue = (courseId, groupId, labId, delta, sessionNo) =>
 };
 
 
+// --- Ручное открытие / досрочное закрытие записи (issue #10) ----------------
+//
+// Admin-only (require_admin cookie). Override хранится per (course, group) и
+// живёт до начала следующего локального дня: open -> синтетическая сессия
+// (внештатное занятие, регистрация разрешена); close -> стоп новым записям,
+// ожидающие остаются видимы; auto -> снова по расписанию.
+//
+// В отличие от студенческих queue-функций выше, эти идут через dev-прокси
+// /api/v1 (vite.config.js rewrite -> /admin на backend), same-origin, чтобы
+// admin-cookie уходил без CORS-обёртки — так же, как AdminQueuePage шлёт свои
+// call/uncall/set-status. requestDefenseQueue уже ставит credentials:"include"
+// и вытаскивает стабильные коды ошибок (SESSION_REQUIRED и т.п.).
+
+const adminQueueOverrideUrl = (courseId, groupId, action) =>
+  `/api/v1/admin/courses/${encodeURIComponent(courseId)}/groups/${encodeURIComponent(groupId)}/queue/${action}`;
+
+const adminQueueStateUrl = (courseId) =>
+  `/api/v1/admin/courses/${encodeURIComponent(courseId)}/queue/state`;
+
+export const fetchQueueState = (courseId) =>
+  requestDefenseQueue(adminQueueStateUrl(courseId));
+
+export const openQueue = (courseId, groupId) =>
+  requestDefenseQueue(adminQueueOverrideUrl(courseId, groupId, "open"), { method: "POST" });
+
+export const closeQueue = (courseId, groupId) =>
+  requestDefenseQueue(adminQueueOverrideUrl(courseId, groupId, "close"), { method: "POST" });
+
+export const autoQueue = (courseId, groupId) =>
+  requestDefenseQueue(adminQueueOverrideUrl(courseId, groupId, "auto"), { method: "POST" });
+
+
 // --- Секретная ссылка /j/{token} (docs/SECRET_JOIN_LINKS_PLAN.md §7, §10) ---
 //
 // Backend отдаёт в `detail` стабильные коды (LINK_NOT_FOUND, JOIN_NOT_OPEN,
@@ -432,7 +464,6 @@ export async function gradeLab(courseId, groupId, labId, github) {
       if (typeof data.detail === "string") {
         errorMessage = data.detail;
       } else if (Array.isArray(data.detail)) {
-        // FastAPI validation errors: [{loc: [...], msg: "...", type: "..."}]
         errorMessage = data.detail.map(formatValidationError).join("\n");
       }
     }
