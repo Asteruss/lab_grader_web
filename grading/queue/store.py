@@ -581,6 +581,21 @@ def register(
         # данные (потеря записи). Диапазон таблицы (A1:H200) покрывает
         # вычисленный индекс — строка попадает внутрь таблицы.
         new_row_index = max((r.row_index for r in rows), default=1) + 1
+        new_row = QueueRow(
+            position=position, group=group, fio=fio, lab=lab,
+            session_no=session_no, status=STATUS_WAITING,
+            row_index=new_row_index, github=github, signup_time=signup_time,
+        )
+        # Постоянная сортировка: строка пишется в физический конец листа,
+        # поэтому без пересортировки порядок сохраняется, только если лист
+        # уже отсортирован и ключ новой строки не меньше последнего. Иначе
+        # (запись в пару с меньшим номером, беспорядок от ручных правок)
+        # лист пересортируется после записи — и до, и после добавления
+        # лист остаётся отсортированным.
+        keys = [_row_order_key(row) for row in rows]
+        needs_sort = any(a > b for a, b in zip(keys, keys[1:])) or (
+            bool(keys) and _row_order_key(new_row) < keys[-1]
+        )
         _write_cells(
             worksheet,
             [{
@@ -591,22 +606,29 @@ def register(
                 ]],
             }],
         )
-        cache.append_row_to_cache(
-            spreadsheet.id, today.isoformat(),
-            QueueRow(
-                position=position, group=group, fio=fio, lab=lab,
-                session_no=session_no, status=STATUS_WAITING,
-                row_index=new_row_index, github=github, signup_time=signup_time,
-            ),
-        )
+        cache.append_row_to_cache(spreadsheet.id, today.isoformat(), new_row)
+        if needs_sort:
+            _sort_sheet_rows(spreadsheet, today.isoformat(), worksheet)
         return position
 
 
+def _row_order_key(row: QueueRow) -> tuple:
+    """Порядок постоянной сортировки листа: (группа, пара, позиция-тикет),
+    при равенстве — текущая физическая строка (стабильность)."""
+    return (
+        row.group or "",
+        row.session_no if row.session_no is not None else 0,
+        row.position or 10**6,
+        row.row_index,
+    )
+
+
 def _sort_sheet_rows(spreadsheet, today_str: str, worksheet) -> None:
-    """Постоянная сортировка физических строк листа, «сортировать
+    """Постоянная сортировка физических строк листа («сортировать
     постоянно»): строки переписываются в порядке
-    (группа, пара, позиция-тикет) после мутаций, меняющих тикеты
-    (сдвиг, возврат из вызванных). Остальные мутации порядок не ломают.
+    (группа, пара, позиция-тикет) после мутаций, меняющих порядок
+    (добавление в пару с меньшим ключом, сдвиг, возврат из вызванных).
+    Остальные мутации порядок не ломают.
 
     Порядок строк в кэше = физический порядок, поэтому после пересортировки
     кэш строк инвалидируется.
@@ -615,15 +637,7 @@ def _sort_sheet_rows(spreadsheet, today_str: str, worksheet) -> None:
     if not rows:
         return
 
-    def _order_key(row):
-        return (
-            row.group or "",
-            row.session_no if row.session_no is not None else 0,
-            row.position or 10**6,
-            row.row_index,
-        )
-
-    ordered = sorted(rows, key=_order_key)
+    ordered = sorted(rows, key=_row_order_key)
     if [r.row_index for r in ordered] == [r.row_index for r in rows]:
         return  # уже отсортировано
 

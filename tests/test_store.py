@@ -212,10 +212,38 @@ def test_register_numbers_the_pair_queue_across_labs():
 
     sheet = spreadsheet.sheets["Очередь-2026-11-08"]
     rows = read_queue_rows(sheet)
+    # Постоянная сортировка: после добавления лист лежит в порядке
+    # (группа, пара, позиция) — Сидорова (пара 1) поднялась выше пары 2.
     assert [(row.fio, row.lab, row.session_no, row.position) for row in rows] == [
+        ("Сидорова", "ЛР1", 1, 1),
         ("Новиков", "ЛР2", 2, 1),
         ("Морозова", "ЛР1", 2, 2),
-        ("Сидорова", "ЛР1", 1, 1),
+    ]
+
+
+def test_register_resorts_disordered_sheet():
+    """Постоянная сортировка: физический беспорядок, накопившийся до фикса
+    (пара 9 записана раньше пары 1 и лежит выше), исправляется следующей
+    регистрацией — лист всегда отсортирован до и после добавления."""
+    spreadsheet = FakeSpreadsheet()
+    today = date(2026, 11, 8)
+    sheet = FakeWorksheet("Очередь-2026-11-08", spreadsheet.next_id, [QUEUE_HEADERS])
+    spreadsheet.next_id += 1
+    spreadsheet.sheets[sheet.title] = sheet
+    sheet.append_row([1, "4432", "Новиков", "ЛР2", 9, "Asteruss", "23:29", STATUS_PASSED])
+    sheet.append_row([1, "4432", "Волков", "ЛР2", 1, "Gerasimov", "23:29", STATUS_WITHDRAWN])
+    sheet.append_row([3, "4432", "Морозова", "ЛР2", 9, "hikara33", "23:32", STATUS_WAITING])
+
+    # Новая запись в пару 9 (последний тикет пары): сама по себе она порядок
+    # не ломает, но лист уже разупорядочен — регистрация его пересортирует.
+    assert register(spreadsheet, today, "4432", "Петров", "ЛР2", session_no=9) == 4
+
+    rows = read_queue_rows(sheet)
+    assert [(row.fio, row.session_no, row.position) for row in rows] == [
+        ("Волков", 1, 1),
+        ("Новиков", 9, 1),
+        ("Морозова", 9, 3),
+        ("Петров", 9, 4),
     ]
 
 
