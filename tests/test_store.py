@@ -166,8 +166,9 @@ def test_ensure_sheets_uses_exact_headers_and_protects_data():
     rule_conditions = [r["booleanRule"]["condition"]["values"][0]["userEnteredValue"] for r in format_rules]
     assert sorted(rule_conditions) == sorted(STATUS_BG_COLORS)
     dims = [item["updateDimensionProperties"] for item in requests if "updateDimensionProperties" in item]
-    fio_dim = next(d for d in dims if d["range"]["startColumnIndex"] == QUEUE_HEADERS.index("ФИО"))
+    fio_dim = next(d for d in dims if d["range"]["startIndex"] == QUEUE_HEADERS.index("ФИО"))
     assert fio_dim["range"]["dimension"] == "COLUMNS"
+    assert fio_dim["range"]["endIndex"] == QUEUE_HEADERS.index("ФИО") + 1
     assert fio_dim["properties"]["pixelSize"] == 240
     assert any("setBasicFilter" in item for item in requests)
     tables = [item["addTable"]["table"] for item in requests if "addTable" in item]

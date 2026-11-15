@@ -220,8 +220,8 @@ def _setup_new_sheet(
                 "range": {
                     "sheetId": worksheet.id,
                     "dimension": "COLUMNS",
-                    "startColumnIndex": FIO_COL_INDEX,
-                    "endColumnIndex": FIO_COL_INDEX + 1,
+                    "startIndex": FIO_COL_INDEX,
+                    "endIndex": FIO_COL_INDEX + 1,
                 },
                 "properties": {"pixelSize": FIO_COLUMN_WIDTH_PX},
                 "fields": "pixelSize",
@@ -544,12 +544,14 @@ def register(
         # Position after all existing entries in this (group, session) pair
         # queue, including finished ones, so new entries don't collide with
         # finished positions. The lab is only a label — the pair shares one
-        # numbering (issue #62 review).
+        # numbering (issue #62 review). Entries without a pair (Пар№ пуст)
+        # видны во всех парах (как в list_waiting) — они тоже участвуют
+        # в max, иначе пара получает вторую «позицию 1» рядом с такой строкой.
         in_scope = [
             row
             for row in rows
             if row.group == group
-            and (session_no is None or row.session_no == session_no)
+            and (session_no is None or row.session_no in (None, session_no))
         ]
         max_pos = max((row.position for row in in_scope if row.position), default=0)
         position = max_pos + 1
