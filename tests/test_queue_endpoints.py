@@ -996,12 +996,12 @@ class TestQueueCall:
         assert data["status"] == "returned"
 
         rows = ws.get_all_values()
-        # Bob сохраняет свой билет (2) и остаётся первым ждущим;
-        # Alice возвращается в конец с новым билетом 3 (max + 1).
+        # Лист пересортирован (постоянная сортировка): Bob (билет 2) —
+        # первый ждущий, Alice (билет 3) — в конце пары.
+        assert rows[1][0] == "2"
         assert rows[1][7] == STATUS_WAITING
-        assert rows[1][0] == "3"
+        assert rows[2][0] == "3"
         assert rows[2][7] == STATUS_WAITING
-        assert rows[2][0] == "2"
 
     def test_uncall_not_called_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)

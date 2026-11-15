@@ -602,6 +602,47 @@ def register(
         return position
 
 
+def _sort_sheet_rows(spreadsheet, today_str: str, worksheet) -> None:
+    """Постоянная сортировка физических строк листа, «сортировать
+    постоянно»): строки переписываются в порядке
+    (группа, пара, позиция-тикет) после мутаций, меняющих тикеты
+    (сдвиг, возврат из вызванных). Остальные мутации порядок не ломают.
+
+    Порядок строк в кэше = физический порядок, поэтому после пересортировки
+    кэш строк инвалидируется.
+    """
+    rows = read_queue_rows(worksheet)
+    if not rows:
+        return
+
+    def _order_key(row):
+        return (
+            row.group or "",
+            row.session_no if row.session_no is not None else 0,
+            row.position or 10**6,
+            row.row_index,
+        )
+
+    ordered = sorted(rows, key=_order_key)
+    if [r.row_index for r in ordered] == [r.row_index for r in rows]:
+        return  # уже отсортировано
+
+    updates = [
+        {
+            "range": f"A{physical_row}",
+            "values": [[
+                row.position if row.position is not None else "",
+                row.group, row.fio, row.lab,
+                row.session_no if row.session_no is not None else "",
+                row.github, row.signup_time, row.status,
+            ]],
+        }
+        for physical_row, row in enumerate(ordered, start=2)
+    ]
+    _write_cells(worksheet, updates)
+    cache.invalidate_queue(spreadsheet.id, today_str)
+
+
 def withdraw(
     spreadsheet,
     today: date,
@@ -691,6 +732,7 @@ def shift_down(
             for entry, ticket in zip(rotated, tickets)
         ]
         _write_cells(worksheet, updates)
+        _sort_sheet_rows(spreadsheet, today.isoformat(), worksheet)
         cache.invalidate_queue(spreadsheet.id, today.isoformat())
         return current_index + 1, new_index + 1
 
@@ -837,6 +879,7 @@ def uncall(
                 {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WAITING]]},
             ],
         )
+        _sort_sheet_rows(spreadsheet, today.isoformat(), worksheet)
         cache.invalidate_queue(spreadsheet.id, today.isoformat())
 
 

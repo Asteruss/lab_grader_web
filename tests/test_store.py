@@ -257,9 +257,10 @@ def test_shift_down_only_for_waiting_entries_and_clamps_at_end():
 
     assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 1) == (1, 2)
     rows = read_queue_rows(sheet)
+    # Лист пересортирован (постоянная сортировка): тикеты по порядку.
     assert [(row.fio, row.position) for row in rows] == [
-        ("Иванов", 2),
         ("Петров", 1),
+        ("Иванов", 2),
         ("Сидоров", 3),
     ]
     assert shift_down(spreadsheet, date(2026, 11, 8), "4431", "Иванов", 99) == (2, 3)
@@ -289,13 +290,13 @@ def test_shift_down_rotates_tickets_within_segment_only():
     assert (old, new) == (1, 3)
 
     rows = read_queue_rows(sheet)
-    # В листе порядок строк не меняется; очередь (по билетам):
+    # Лист пересортирован (постоянная сортировка) в порядке тикетов пары:
     # Иванов(1, вызван) -> Сидоров(2) -> Кузнецов(3) -> Петров(5).
     assert [(row.fio, row.position, row.status) for row in rows] == [
         ("Иванов", 1, STATUS_CALLED),      # билет вызванного не тронут
-        ("Петров", 5, STATUS_WAITING),     # взял последний билет сегмента
         ("Сидоров", 2, STATUS_WAITING),    # занял билет Петрова
         ("Кузнецов", 3, STATUS_WAITING),   # занял билет Сидорова
+        ("Петров", 5, STATUS_WAITING),     # взял последний билет сегмента
     ]
 
 
