@@ -49,9 +49,11 @@ export const getQueueLoginUrl = (courseId, groupId, labId) =>
   `${API_BASE_URL}/courses/${encodeURIComponent(courseId)}/groups/${encodeURIComponent(groupId)}/labs/${encodeURIComponent(labId)}/queue/login`;
 
 const requestDefenseQueue = async (url, options = {}) => {
+  // OAuth plan §1/§4: очередь работает без cookies — identity приходит
+  // в теле запроса (GitHub OAuth code), credentials не нужны.
   let response;
   try {
-    response = await fetch(url, { credentials: "include", ...options });
+    response = await fetch(url, options);
   } catch (cause) {
     const error = new Error("Queue request failed", { cause });
     error.code = "unknown";
@@ -91,12 +93,6 @@ export const fetchDefenseQueueStatus = (courseId, groupId, labId, sessionNo) => 
   return requestDefenseQueue(url.toString());
 };
 
-export const fetchDefenseQueue = (courseId, groupId, labId, sessionNo) => {
-  const url = new URL(defenseQueueUrl(courseId, groupId, labId));
-  if (sessionNo != null) url.searchParams.set("session_no", sessionNo);
-  return requestDefenseQueue(url.toString());
-};
-
 export const fetchLabDetails = async (courseId, groupId, labId) => {
   const url = `${API_BASE_URL}/courses/${encodeURIComponent(courseId)}/groups/${encodeURIComponent(groupId)}/labs/${encodeURIComponent(labId)}`;
   const response = await fetch(url, { credentials: "include" });
@@ -107,6 +103,58 @@ export const fetchLabDetails = async (courseId, groupId, labId) => {
   }
   return response.json();
 };
+
+
+// --- Очередь через GitHub OAuth (PLAN_queue_oauth.md §3/§4) ----------------
+//
+// Identity per-request: фронт получает OAuth code (redirect back с
+// ?queue_code=...), POST'ит его в теле мутации вместе с ФИО/группой;
+// сервер обменивает код на подтверждённый username и сверяет с таблицей.
+// Никаких cookies и сессий.
+
+export const getQueueOAuthStartUrl = (courseId, groupId, labId) =>
+  `${defenseQueueUrl(courseId, groupId, labId)}/oauth/start`;
+
+export const fetchDefenseQueue = (courseId, groupId, labId, { studentName, studentGroup } = {}) => {
+  const url = new URL(defenseQueueUrl(courseId, groupId, labId));
+  if (studentName) url.searchParams.set("student_name", studentName);
+  if (studentGroup) url.searchParams.set("student_group", studentGroup);
+  return requestDefenseQueue(url.toString());
+};
+
+export const registerInQueue = ({ courseId, groupId, labId, code, studentName, studentGroup }) =>
+  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      student_name: studentName,
+      student_group: studentGroup,
+    }),
+  });
+
+export const withdrawFromQueue = ({ courseId, groupId, labId, code, studentName, studentGroup }) =>
+  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/withdraw`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      student_name: studentName,
+      student_group: studentGroup,
+    }),
+  });
+
+export const shiftInQueue = ({ courseId, groupId, labId, code, studentName, studentGroup, delta }) =>
+  requestDefenseQueue(`${defenseQueueUrl(courseId, groupId, labId)}/shift`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      student_name: studentName,
+      student_group: studentGroup,
+      delta,
+    }),
+  });
 
 export const extractSessionNo = (session) => {
   if (!session?.slot_id) return null;

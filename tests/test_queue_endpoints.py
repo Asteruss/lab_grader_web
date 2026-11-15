@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from starlette.requests import Request
 
 import main as main_module
@@ -166,9 +167,19 @@ def _fake_session():
     )
 
 
-def _make_student_cookie(username="alice", course_id="dev-course",
-                         group_id="4431", fio="Alice Student"):
-    return build_student_session(SIGNER, username, fio, course_id, group_id)
+def _student_query(fio="Alice Student", group_id="4431"):
+    """Query-идентификация для read-only эндпоинтов (OAuth plan §3)."""
+    from urllib.parse import quote
+    return f"student_name={quote(fio)}&student_group={quote(group_id)}"
+
+
+_VALID_CODE = "valid-oauth-code"
+
+
+def _oauth_body(**extra):
+    body = {"code": _VALID_CODE, "student_name": "Alice Student", "student_group": "4431"}
+    body.update(extra)
+    return body
 
 
 def _make_admin_cookie():
@@ -252,6 +263,12 @@ def deps(monkeypatch):
 
     monkeypatch.setattr(main_module, "GitHubClient", lambda token: SimpleNamespace())
     monkeypatch.setattr(main_module, "_schedule_group_ids", lambda cid: ["4431", "4432"])
+    # OAuth plan §3: обмен кода на подтверждённый username мокается;
+    # "valid" -> alice, всё остальное -> None (OAUTH_FAILED).
+    monkeypatch.setattr(
+        main_module, "_exchange_code_for_username",
+        lambda code, uri: "alice" if code == _VALID_CODE else None,
+    )
 
     return fake_ss
 
@@ -272,27 +289,24 @@ class TestQueueLogin:
 
 
 class TestQueueStatus:
-    def test_without_cookie_returns_session_required(self, deps):
+    def test_without_identification_returns_session_required(self, deps):
         data = main_module.queue_status(_mock_request(), "dev-course", "4431", "1")
         assert data["session_required"] is True
         assert data["in_queue"] is False
         assert data["queue_open"] is True
 
-    def test_with_valid_cookie_returns_queue_info(self, deps):
-        cookie = _make_student_cookie()
+    def test_with_identification_returns_queue_info(self, deps):
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data.get("session_required") is not True
         assert data["in_queue"] is False
         assert data["queue_open"] is True
         assert data["can_register"] is True
 
-    def test_with_wrong_group_cookie_returns_session_required(self, deps):
-        cookie = _make_student_cookie(group_id="4432")
+    def test_with_wrong_group_returns_session_required(self, deps):
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
+            _mock_request(query=_student_query(group_id="4432")),
             "dev-course", "4431", "1",
         )
         assert data["session_required"] is True
@@ -301,10 +315,8 @@ class TestQueueStatus:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["in_queue"] is True
         assert data["position"] == 1
@@ -316,10 +328,8 @@ class TestQueueStatus:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([2, "4431", "Alice Student", "ЛР2", "2", "alice", "10:00", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["in_queue"] is True
         assert data["position"] == 2
@@ -333,10 +343,8 @@ class TestQueueStatus:
         # Завершённая запись другой пары дня не раздувает размер очереди пары.
         ws.append_row([1, "4431", "Early", "ЛР1", "1", "early", "09:00", STATUS_PASSED])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["in_queue"] is True
         assert data["position"] == 1
@@ -349,10 +357,8 @@ class TestQueueStatus:
         history = deps.worksheet("История_очереди")
         history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", "", "", STATUS_PASSED])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["already_passed"] is False
         assert data["queue_open"] is True
@@ -361,10 +367,8 @@ class TestQueueStatus:
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
         monkeypatch.setattr(main_module, "_queue_next_session", lambda *a, **kw: _fake_session())
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["queue_open"] is False
         assert data["can_register"] is False
@@ -378,10 +382,8 @@ class TestQueueStatus:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["queue_open"] is False
         assert data["can_register"] is False
@@ -406,8 +408,7 @@ class TestQueueStatus:
         )
 
         data = main_module.queue_status(
-            _mock_request({"student_session": _make_student_cookie()}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
 
         assert data["is_team_lab"] is True
@@ -418,10 +419,8 @@ class TestQueueStatus:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_CALLED])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_status(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
+            _mock_request(query=_student_query()), "dev-course", "4431", "1",
         )
         assert data["called"] is True
         assert data["in_queue"] is True
@@ -431,38 +430,63 @@ class TestQueueStatus:
 
 class TestQueueRegister:
     def test_register_success(self, deps):
-        cookie = _make_student_cookie()
         data = main_module.queue_register(
-            _mock_request({"student_session": cookie}),
+            _post_request(json_body=_oauth_body()),
             "dev-course", "4431", "1",
+            main_module.QueueRegisterRequest(**_oauth_body()),
         )
         assert data["position"] == 1
         assert data["queue_size"] == 1
 
-    def test_without_cookie_returns_401(self, deps):
-        with pytest.raises(HTTPException) as exc:
-            main_module.queue_register(_mock_request(), "dev-course", "4431", "1")
-        assert exc.value.status_code == 401
-        assert exc.value.detail == "SESSION_REQUIRED"
+    def test_without_code_returns_422(self, deps):
+        body = {"student_name": "Alice Student", "student_group": "4431"}
+        with pytest.raises(ValidationError):
+            main_module.queue_register(
+                _post_request(json_body=body), "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**body),
+            )
 
-    def test_with_wrong_group_returns_401(self, deps):
-        cookie = _make_student_cookie(group_id="4432")
+    def test_with_bad_code_returns_401(self, deps):
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body(code="bad-code")),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body(code="bad-code")),
             )
         assert exc.value.status_code == 401
+        assert exc.value.detail == "OAUTH_FAILED"
+
+    def test_with_wrong_group_returns_403(self, deps):
+        with pytest.raises(HTTPException) as exc:
+            main_module.queue_register(
+                _post_request(json_body=_oauth_body(student_group="4432")),
+                "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body(student_group="4432")),
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "GROUP_MISMATCH"
+
+    def test_with_foreign_name_returns_403(self, deps):
+        # OAuth plan §3: имя в body должно совпадать с ФИО строки студента,
+        # привязанной к подтверждённому GitHub-логину.
+        with pytest.raises(HTTPException) as exc:
+            main_module.queue_register(
+                _post_request(json_body=_oauth_body(student_name="Bob Student")),
+                "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body(student_name="Bob Student")),
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "STUDENT_MISMATCH"
 
     def test_when_already_in_queue_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 409
         assert exc.value.detail == "ALREADY_IN_QUEUE"
@@ -473,11 +497,11 @@ class TestQueueRegister:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_CALLED])
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 409
         assert exc.value.detail == "ALREADY_IN_QUEUE"
@@ -500,11 +524,11 @@ class TestQueueRegister:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "2",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 409
         assert exc.value.detail == "ALREADY_IN_QUEUE"
@@ -516,11 +540,11 @@ class TestQueueRegister:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "1", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 409
         assert exc.value.detail == "ALREADY_IN_QUEUE"
@@ -529,11 +553,11 @@ class TestQueueRegister:
         history = deps.worksheet("История_очереди")
         history.append_row(["2026-11-08", "1", "4431", "Alice Student", "ЛР1", "", "", "", STATUS_PASSED])
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 400
         assert exc.value.detail == "ALREADY_PASSED"
@@ -541,11 +565,11 @@ class TestQueueRegister:
     def test_when_queue_closed_returns_403(self, deps, monkeypatch):
         monkeypatch.setattr(main_module, "_queue_active_session", lambda *a, **kw: None)
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 403
         assert exc.value.detail == "QUEUE_CLOSED"
@@ -558,11 +582,11 @@ class TestQueueRegister:
 
         monkeypatch.setattr(main_module, "ensure_ci_passed", fail_ci)
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 400
         assert exc.value.detail == "CI_NOT_PASSED"
@@ -575,11 +599,11 @@ class TestQueueRegister:
 
         monkeypatch.setattr(main_module, "ensure_ci_passed", pending_ci)
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 409
         assert exc.value.detail == "CI_PENDING"
@@ -606,8 +630,9 @@ class TestQueueRegister:
         monkeypatch.setattr(main_module, "ensure_ci_passed", pass_ci)
 
         data = main_module.queue_register(
-            _mock_request({"student_session": _make_student_cookie()}),
+            _post_request(json_body=_oauth_body()),
             "dev-course", "4431", "1",
+            main_module.QueueRegisterRequest(**_oauth_body()),
         )
 
         assert checked["repo_name"] == "lab1-team-1"
@@ -638,8 +663,9 @@ class TestQueueRegister:
 
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": _make_student_cookie()}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
 
         assert exc.value.status_code == 400
@@ -651,24 +677,37 @@ class TestQueueWithdraw:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
         data = main_module.queue_withdraw(
-            _mock_request({"student_session": cookie}),
+            _post_request(json_body=_oauth_body()),
             "dev-course", "4431", "1",
+            main_module.QueueWithdrawRequest(**_oauth_body()),
         )
         assert data["status"] == "withdrawn"
 
-    def test_without_cookie_returns_401(self, deps):
-        with pytest.raises(HTTPException) as exc:
-            main_module.queue_withdraw(_mock_request(), "dev-course", "4431", "1")
-        assert exc.value.status_code == 401
+    def test_without_code_returns_422(self, deps):
+        body = {"student_name": "Alice Student", "student_group": "4431"}
+        with pytest.raises(ValidationError):
+            main_module.queue_withdraw(
+                _post_request(json_body=body), "dev-course", "4431", "1",
+                main_module.QueueWithdrawRequest(**body),
+            )
 
-    def test_when_not_in_queue_returns_404(self, deps):
-        cookie = _make_student_cookie()
+    def test_with_bad_code_returns_401(self, deps):
         with pytest.raises(HTTPException) as exc:
             main_module.queue_withdraw(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body(code="bad-code")),
                 "dev-course", "4431", "1",
+                main_module.QueueWithdrawRequest(**_oauth_body(code="bad-code")),
+            )
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "OAUTH_FAILED"
+
+    def test_when_not_in_queue_returns_404(self, deps):
+        with pytest.raises(HTTPException) as exc:
+            main_module.queue_withdraw(
+                _post_request(json_body=_oauth_body()),
+                "dev-course", "4431", "1",
+                main_module.QueueWithdrawRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 404
         assert exc.value.detail == "NOT_IN_QUEUE"
@@ -677,11 +716,11 @@ class TestQueueWithdraw:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WITHDRAWN])
 
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_withdraw(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "1",
+                main_module.QueueWithdrawRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 409
 
@@ -692,32 +731,31 @@ class TestQueueShift:
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
         ws.append_row([2, "4431", "Bob Student", "ЛР1", "", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
+        body = {**_oauth_body(), "delta": 1}
         data = main_module.queue_shift(
-            _post_request(json_body={"delta": 1},
-                          cookies={"student_session": cookie}),
+            _post_request(json_body=body),
             "dev-course", "4431", "1",
-            main_module.QueueShiftRequest(delta=1),
+            main_module.QueueShiftRequest(**body),
         )
         assert data["old_position"] == 1
         assert data["new_position"] == 2
 
-    def test_without_cookie_returns_401(self, deps):
-        with pytest.raises(HTTPException) as exc:
+    def test_without_code_returns_422(self, deps):
+        body = {"student_name": "Alice Student", "student_group": "4431", "delta": 1}
+        with pytest.raises(ValidationError):
             main_module.queue_shift(
-                _post_request(json_body={"delta": 1}),
+                _post_request(json_body=body),
                 "dev-course", "4431", "1",
-                main_module.QueueShiftRequest(delta=1),
+                main_module.QueueShiftRequest(**body),
             )
-        assert exc.value.status_code == 401
 
     def test_when_not_in_queue_returns_404(self, deps):
-        cookie = _make_student_cookie()
+        body = {**_oauth_body(), "delta": 1}
         with pytest.raises(HTTPException) as exc:
             main_module.queue_shift(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=body),
                 "dev-course", "4431", "1",
-                main_module.QueueShiftRequest(delta=1),
+                main_module.QueueShiftRequest(**body),
             )
         assert exc.value.status_code == 404
 
@@ -725,12 +763,12 @@ class TestQueueShift:
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice Student", "ЛР1", "", "", "", STATUS_WAITING])
 
-        cookie = _make_student_cookie()
+        body = {**_oauth_body(), "delta": 1}
         with pytest.raises(HTTPException) as exc:
             main_module.queue_shift(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=body),
                 "dev-course", "4431", "1",
-                main_module.QueueShiftRequest(delta=1),
+                main_module.QueueShiftRequest(**body),
             )
         assert exc.value.status_code == 400
         assert exc.value.detail == "INVALID_SHIFT"
@@ -743,11 +781,7 @@ class TestQueueList:
         ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
         ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_PASSED])
 
-        cookie = _make_student_cookie()
-        data = main_module.queue_list(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
-        )
+        data = main_module.queue_list(_mock_request(), "dev-course", "4431", "1")
         # All entries returned (waiting + finished), positions preserved.
         assert data["size"] == 3
         assert len(data["queue"]) == 3
@@ -781,7 +815,7 @@ class TestQueueList:
         assert data["size"] == 1
         assert len(data["queue"]) == 1
 
-    def test_with_admin_cookie_works(self, deps):
+    def test_admin_request_works(self, deps):
         admin_cookie = _make_admin_cookie()
         data = main_module.queue_list(
             _mock_request({"admin_session": admin_cookie}),
@@ -790,11 +824,7 @@ class TestQueueList:
         assert data["size"] == 0
 
     def test_empty_queue(self, deps):
-        cookie = _make_student_cookie()
-        data = main_module.queue_list(
-            _mock_request({"student_session": cookie}),
-            "dev-course", "4431", "1",
-        )
+        data = main_module.queue_list(_mock_request(), "dev-course", "4431", "1")
         assert data["size"] == 0
         assert data["queue"] == []
 
@@ -1056,10 +1086,9 @@ class TestQueueErrors:
             "_meta": {"filename": "t.yaml", "status": "active", "priority": 0,
                        "logo": None, "featured": False},
         })
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_status(
-                _mock_request({"student_session": cookie}),
+                _mock_request(query=_student_query()),
                 "dev-course", "4431", "999",
             )
         assert exc.value.status_code == 404
@@ -1070,11 +1099,11 @@ class TestQueueErrors:
             "_meta": {"filename": "t.yaml", "status": "active", "priority": 0,
                        "logo": None, "featured": False},
         })
-        cookie = _make_student_cookie()
         with pytest.raises(HTTPException) as exc:
             main_module.queue_register(
-                _mock_request({"student_session": cookie}),
+                _post_request(json_body=_oauth_body()),
                 "dev-course", "4431", "999",
+                main_module.QueueRegisterRequest(**_oauth_body()),
             )
         assert exc.value.status_code == 404
 

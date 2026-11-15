@@ -284,6 +284,20 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+@app.exception_handler(Exception)
+async def _catch_all_exception_handler(request: Request, exc: Exception):
+    """Return a 500 JSONResponse so CORSMiddleware can attach CORS headers.
+
+    Without this, an unhandled exception reaches the browser as net::ERR_FAILED
+    with no Access-Control-Allow-Origin header, which the frontend cannot tell
+    apart from a network failure. Specific handlers (HTTPException,
+    RequestValidationError, RateLimitExceeded) still take precedence over this
+    catch-all.
+    """
+    logger.exception(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Внутренняя ошибка сервера"})
+
 # Проверка обязательных переменных окружения
 if not ADMIN_LOGIN or not ADMIN_PASSWORD:
     raise RuntimeError(
@@ -299,10 +313,13 @@ if not GITHUB_TOKEN:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",  # Разрешить запросы с любых источников
-    allow_credentials=True,
-    allow_methods=["*"],  # Разрешить все HTTP-методы
-    allow_headers=["*"],  # Разрешить все заголовки
+    # Cookies убраны везде (очередь + /register, OAuth plan §1): с
+    # allow_credentials=False опция allow_origins=["*"] безопасна, и
+    # credentialed-ответы больше не нужны (браузер блокирует "*" + credentials).
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 signer = TimestampSigner(SECRET_KEY)
 
@@ -1065,47 +1082,24 @@ def register_student(request: Request, course_id: str, group_id: str, student: S
 
         existing_github = sheet.cell(row_idx, github_col_idx).value
 
-        # Build signed student_session cookie from the registration form data.
-        # The queue reads this cookie instead of requiring a separate GitHub OAuth.
-        student_token = build_student_session(
-            signer,
-            github=student.github,
-            fio=full_name,
-            course_id=course_id,
-            group_id=group_id,
-        )
+        # /register only binds the GitHub handle to the student row now (OAuth
+        # plan §2): no student_session cookie is set. Queue mutations
+        # authenticate per-request via a GitHub OAuth code (see
+        # /queue/oauth/start and POST /queue/{register,withdraw,shift}), so no
+        # session survives this request -- several people can register from
+        # the same machine without clobbering each other.
 
         if not existing_github:
             sheet.update_cell(row_idx, github_col_idx, student.github)
             logger.info(f"Successfully registered GitHub '{student.github}' for student '{full_name}'")
-            response = JSONResponse(content={"status": "registered", "message": "Аккаунт GitHub успешно задан"})
-            response.set_cookie(
-                key=STUDENT_SESSION_COOKIE,
-                value=student_token,
-                httponly=True,
-                samesite="lax",
-                max_age=STUDENT_SESSION_MAX_AGE,
-                path="/",
-                secure=False,
-            )
-            return response
+            return {"status": "registered", "message": "Аккаунт GitHub успешно задан. Войдите через GitHub, чтобы записаться в очередь."}
 
         if existing_github == student.github:
             logger.info(f"Student '{full_name}' already registered with GitHub '{student.github}'")
-            response = JSONResponse(content={
+            return {
                 "status": "already_registered",
                 "message": "Этот аккаунт GitHub уже был указан ранее для этого же студента",
-            })
-            response.set_cookie(
-                key=STUDENT_SESSION_COOKIE,
-                value=student_token,
-                httponly=True,
-                samesite="lax",
-                max_age=STUDENT_SESSION_MAX_AGE,
-                path="/",
-                secure=False,
-            )
-            return response
+            }
 
         # Conflict: student tries to set a different GitHub account
         logger.warning(f"GitHub conflict for '{full_name}': existing='{existing_github}', attempted='{student.github}'")
@@ -2999,6 +2993,33 @@ def _require_student_session(request, course_id, group_id):
     return payload["github"], payload.get("fio", "")
 
 
+def _queue_resolve_username_from_code(request: Request, code: str | None) -> str:
+    """Exchange a GitHub OAuth ``code`` for the confirmed student username.
+
+    Replaces the student_session cookie as the source of identity for queue
+    mutations (OAuth plan §3): the username now comes from a fresh token
+    exchange on every request, never from a forgeable cookie. The code lives
+    exactly one request -- it is exchanged here, used for the mutation, and
+    forgotten; nothing is stored.
+    """
+    if not code:
+        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+    username = _exchange_code_for_username(code, _oauth_redirect_uri(request))
+    if username is None:
+        raise HTTPException(status_code=401, detail="OAUTH_FAILED")
+    return username
+
+
+def _queue_verify_student_scope(student_group: str, group_id: str) -> None:
+    """Reject a mutation whose declared group does not match the URL group.
+
+    The path parameter is authoritative; the body field is a cross-check so a
+    student cannot act on another group's queue by editing the request body.
+    """
+    if student_group != group_id:
+        raise HTTPException(status_code=403, detail="GROUP_MISMATCH")
+
+
 def _queue_error_to_http(error: QueueError) -> HTTPException:
     """Translate a QueueError into an HTTPException with the stable code as detail."""
     return HTTPException(status_code=error.http_status, detail=error.code)
@@ -3146,7 +3167,29 @@ def _schedule_group_ids(course_id: str) -> list[str]:
         return []
 
 
-class QueueShiftRequest(BaseModel):
+class QueueOAuthActionRequest(BaseModel):
+    """Common body for queue mutations authenticated via a GitHub OAuth code.
+
+    The ``code`` is exchanged server-side for the confirmed GitHub username
+    (``_exchange_code_for_username``); ``student_name``/``student_group`` let
+    the server verify the OAuth'd account actually owns that student row
+    (solo labs only -- team labs identify the queue row by team title, which
+    is itself derived from the GitHub login, so the name check is skipped).
+    """
+    code: str = Field(..., min_length=1)
+    student_name: str = Field(..., min_length=1)
+    student_group: str = Field(..., min_length=1)
+
+
+class QueueRegisterRequest(QueueOAuthActionRequest):
+    pass
+
+
+class QueueWithdrawRequest(QueueOAuthActionRequest):
+    pass
+
+
+class QueueShiftRequest(QueueOAuthActionRequest):
     delta: int = Field(..., ge=1)
 
 
@@ -3178,6 +3221,32 @@ def queue_login(request: Request, course_id: str, group_id: str, lab_id: str):
         "state": state,
     }
     logger.info(f"Redirecting to GitHub OAuth for queue login {course_id}/{group_id}/{lab_id}")
+    return RedirectResponse(
+        url=f"https://github.com/login/oauth/authorize?{urlencode(params)}"
+    )
+
+
+@app.get("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/oauth/start")
+@limiter.limit("20/minute")
+def queue_oauth_start(request: Request, course_id: str, group_id: str, lab_id: str):
+    """Canonical OAuth start for queue mutations (OAuth plan §3).
+
+    Same GitHub redirect as ``/queue/login`` -- kept as a separate route so the
+    frontend can target the plan's canonical URL. GitHub redirects back to
+    ``/join/callback``; when the signed ``state`` carries ``purpose == "queue"``
+    the callback forwards the code to the frontend as ``?queue_code=...`` (no
+    cookie, no exchange -- see ``_handle_queue_callback``).
+    """
+    _resolve_queue_lab(course_id, lab_id)
+    if not GITHUB_OAUTH_CLIENT_ID or not GITHUB_OAUTH_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="OAuth App не настроен")
+    state = _build_queue_state(course_id, group_id, lab_id, "queue")
+    params = {
+        "client_id": GITHUB_OAUTH_CLIENT_ID,
+        "redirect_uri": _oauth_redirect_uri(request),
+        "scope": "read:user",
+        "state": state,
+    }
     return RedirectResponse(
         url=f"https://github.com/login/oauth/authorize?{urlencode(params)}"
     )
@@ -3363,28 +3432,25 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         # group stays visible (it outlives the session window).
         scoped = [r for r in rows if r.group == group_id]
 
-        student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
-        student = parse_student_session(signer, student_cookie)
-        session_required = (
-            student is None
-            or student.get("course_id") != course_id
-            or student.get("group_id") != group_id
-        )
+        student_name = request.query_params.get("student_name") or ""
+        student_group = request.query_params.get("student_group") or ""
+        session_required = not student_name or student_group != group_id
 
         # Team labs are not resolved in this branch: without an active
         # session we do not make GitHub network calls just for viewing.
         entry = None
         called_entry = None
         if not is_team_lab(lab_config) and not session_required:
-            fio = student.get("fio", "")
+            fio = student_name
             if fio:
-                github = student.get("github", "")
+                # Read-only (OAuth plan §3): no confirmed GitHub username
+                # here, so the waiting/called row is matched by name alone.
                 entry = find_waiting(
-                    rows, group_id, fio, github=github
+                    rows, group_id, fio, github=""
                 )
                 if entry is None:
                     called_entry = find_called(
-                        rows, group_id, fio, github=github
+                        rows, group_id, fio, github=""
                     )
 
         return {
@@ -3422,16 +3488,12 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     ]
 
     # Check student_session cookie
-    student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
-    student = parse_student_session(signer, student_cookie)
-    session_required = (
-        student is None
-        or student.get("course_id") != course_id
-        or student.get("group_id") != group_id
-    )
+    student_name = request.query_params.get("student_name") or ""
+    student_group = request.query_params.get("student_group") or ""
+    session_required = not student_name or student_group != group_id
 
     if session_required:
-        # Queue is open but student hasn't filled the form.
+        # Queue is open but the caller didn't identify themselves.
         # Still return queue_open and queue_size so they can see the queue.
         return {
             "in_queue": False,
@@ -3448,9 +3510,10 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "session_required": True,
         }
 
-    username = student["github"]
-    fio_from_cookie = student.get("fio", "")
-
+    # Read-only (OAuth plan §3): no confirmed GitHub username here. Team labs
+    # key their queue rows by team title, which is resolved from the GitHub
+    # login at register time; without that login the personal entry stays
+    # empty for them. Solo labs look up the waiting/called row by name.
     # Initialize entry and called_entry to None
     entry = None
     called_entry = None
@@ -3461,19 +3524,9 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     team_info = None
     try:
         if is_team_lab(lab_config):
-            team_result = _resolve_queue_team(
-                GitHubClient(GITHUB_TOKEN), course_info, lab_config, username
-            )
-            if team_result is not None:
-                identifier = team_result.title
-                fio = team_result.title
-                team_info = {
-                    "title": team_result.title,
-                    "repo_name": team_result.repo_name,
-                    "members": list(team_result.members),
-                }
+            pass
         else:
-            fio = fio_from_cookie
+            fio = student_name
             identifier = fio
     except QueueError as e:
         return {
@@ -3491,7 +3544,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
             "error": e.code,
         }
 
-    github_param = "" if is_team_lab(lab_config) else username
+    github_param = ""  # read-only: no confirmed GitHub username available
     entry = (
         find_waiting(rows, group_id, fio, github=github_param)
         if fio
@@ -3548,8 +3601,13 @@ def _session_dict(session) -> dict | None:
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/register")
 @limiter.limit("30/minute")
-def queue_register(request: Request, course_id: str, group_id: str, lab_id: str):
-    """Register the authenticated student in the defense queue."""
+def queue_register(request: Request, course_id: str, group_id: str, lab_id: str, body: QueueRegisterRequest):
+    """Register the authenticated student in the defense queue.
+
+    Auth is per-request via a GitHub OAuth ``code`` (OAuth plan §3): the server
+    exchanges it for the confirmed username, verifies the declared student row
+    is bound to that username, then registers. No cookie is read or set.
+    """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
 
     # Check schedule window BEFORE creating any sheet
@@ -3557,7 +3615,8 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     if session is None:
         raise HTTPException(status_code=403, detail="QUEUE_CLOSED")
 
-    username, _fio = _require_student_session(request, course_id, group_id)
+    username = _queue_resolve_username_from_code(request, body.code)
+    _queue_verify_student_scope(body.student_group, group_id)
     spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
@@ -3587,6 +3646,12 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
             identifier = fio
     except QueueError as e:
         raise _queue_error_to_http(e)
+
+    # OAuth plan §3: verify the declared name matches the row bound to the
+    # confirmed GitHub login. Team labs key the queue row by team title
+    # (derived from the login above), so the name check does not apply there.
+    if not is_team_lab(lab_config) and fio != body.student_name:
+        raise HTTPException(status_code=403, detail="STUDENT_MISMATCH")
 
     lab_short_name = lab_config.get("short-name", lab_key)
     session_no = session_no_from_slot(session.slot_id) if session else None
@@ -3649,12 +3714,16 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
 
 @app.post("/courses/{course_id}/groups/{group_id}/labs/{lab_id}/queue/withdraw")
 @limiter.limit("5/minute")
-def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str):
-    """Withdraw the authenticated student from the queue."""
+def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str, body: QueueWithdrawRequest):
+    """Withdraw the authenticated student from the queue.
+
+    Auth via GitHub OAuth ``code`` (OAuth plan §3); no cookie.
+    """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
     spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
-    username, _fio = _require_student_session(request, course_id, group_id)
+    username = _queue_resolve_username_from_code(request, body.code)
+    _queue_verify_student_scope(body.student_group, group_id)
 
     # Resolve FIO
     try:
@@ -3672,6 +3741,11 @@ def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str)
             fio = ctx.fio
     except QueueError as e:
         raise _queue_error_to_http(e)
+
+    # OAuth plan §3: the declared name must match the row bound to the
+    # confirmed GitHub login (team labs are keyed by team title, skip).
+    if not is_team_lab(lab_config) and fio != body.student_name:
+        raise HTTPException(status_code=403, detail="STUDENT_MISMATCH")
 
     session_no = None
     from datetime import date
@@ -3700,11 +3774,16 @@ def queue_shift(
     lab_id: str,
     body: QueueShiftRequest,
 ):
-    """Shift the authenticated student backward in the queue."""
+    """Shift the authenticated student backward in the queue.
+
+    Auth via GitHub OAuth ``code`` (OAuth plan §3); no cookie. The body also
+    carries ``delta`` (>= 1).
+    """
     course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
     spreadsheet = _get_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
-    username, _fio = _require_student_session(request, course_id, group_id)
+    username = _queue_resolve_username_from_code(request, body.code)
+    _queue_verify_student_scope(body.student_group, group_id)
 
     # Resolve FIO
     try:
@@ -3722,6 +3801,11 @@ def queue_shift(
             fio = ctx.fio
     except QueueError as e:
         raise _queue_error_to_http(e)
+
+    # OAuth plan §3: declared name must match the row bound to the confirmed
+    # GitHub login (team labs keyed by team title, skip).
+    if not is_team_lab(lab_config) and fio != body.student_name:
+        raise HTTPException(status_code=403, detail="STUDENT_MISMATCH")
 
     from datetime import date
     today = date.fromisoformat(today_str)
@@ -3847,27 +3931,25 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
     filtered_rows.sort(key=lambda r: (r.position or 0, r.row_index))
 
     # П.14: персональное состояние запрашивающего студента — из кэша,
-    # без отдельного GET /queue/status.
-    student_cookie = request.cookies.get(STUDENT_SESSION_COOKIE)
-    student = parse_student_session(signer, student_cookie)
+    # без отдельного GET /queue/status. Read-only (OAuth plan §3): студент
+    # идентифицируется query-параметрами, не cookie; github неизвестен, поэтому
+    # строку ищем по ФИО.
+    student_name = request.query_params.get("student_name") or ""
+    student_group = request.query_params.get("student_group") or ""
     me = None
-    if (student is not None
-            and student.get("course_id") == course_id
-            and student.get("group_id") == group_id):
-        github = student.get("github", "")
-        fio = student.get("fio", "")
-        if fio:
-            entry = find_waiting(rows, group_id, fio, github=github)
-            called_entry = (
-                find_called(rows, group_id, fio, github=github)
-                if entry is None else None
-            )
-            me = {
-                "in_queue": entry is not None or called_entry is not None,
-                "position": entry.position if entry else None,
-                "called": called_entry is not None,
-                "queue_size": len(filtered_rows),
-            }
+    if student_name and student_group == group_id:
+        fio = student_name
+        entry = find_waiting(rows, group_id, fio, github="")
+        called_entry = (
+            find_called(rows, group_id, fio, github="")
+            if entry is None else None
+        )
+        me = {
+            "in_queue": entry is not None or called_entry is not None,
+            "position": entry.position if entry else None,
+            "called": called_entry is not None,
+            "queue_size": len(filtered_rows),
+        }
     return {
         "me": me,
         "queue": [
@@ -4214,34 +4296,25 @@ def queue_snapshot(
 # And add this helper function:
 
 def _handle_queue_callback(request: Request, code: str | None, payload: dict):
-    """Handle OAuth callback for queue login (no repo provisioning)."""
+    """OAuth callback for queue mutations: redirect to the frontend with the code.
+
+    Per the OAuth plan, no cookie is set and no token exchange happens here --
+    the code is exchanged per-request inside POST /queue/{register,withdraw,shift}
+    via ``_exchange_code_for_username``. The browser is sent back to the lab
+    page with ``?queue_code=...`` so the frontend can POST it to the mutation
+    endpoint. GitHub redirecting without a code (user denied / error) drops the
+    pending action silently.
+    """
     course_id = payload["course_id"]
     group_id = payload["group_id"]
     lab_id = payload["lab_id"]
 
+    base = _queue_login_redirect(course_id, group_id, lab_id)
     if not code:
-        return RedirectResponse(url=_queue_login_redirect(course_id, group_id, lab_id))
+        return RedirectResponse(url=base)
 
-    username = _exchange_code_for_username(code, _oauth_redirect_uri(request))
-    if username is None:
-        return RedirectResponse(url=_queue_login_redirect(course_id, group_id, lab_id))
-
-    logger.info(f"Queue OAuth confirmed username '{username}' for {course_id}/{group_id}/{lab_id}")
-
-    # Resolve lab_key for the cookie
-    course_info, lab_key, lab_config = _resolve_queue_lab(course_id, lab_id)
-
-    response = RedirectResponse(url=_queue_login_redirect(course_id, group_id, lab_id))
-    response.set_cookie(
-        key=QUEUE_SESSION_COOKIE,
-        value=build_queue_session(signer, username, course_id, group_id, lab_key),
-        httponly=True,
-        samesite="lax",
-        max_age=QUEUE_SESSION_MAX_AGE,
-        path="/",
-        secure=False,
-    )
-    return response
+    sep = "&" if "?" in base else "?"
+    return RedirectResponse(url=f"{base}{sep}queue_code={code}")
 
 
 
