@@ -126,6 +126,44 @@ def test_course_groups_endpoint_supports_prefixes_and_alphanumeric_names(
     assert response.json() == ["4433", "М433"]
 
 
+def test_course_groups_endpoint_excludes_system_queue_sheets_without_config(
+    schedule_admin_client, monkeypatch
+):
+    """Листы, которые создаёт система очереди, не становятся группами, даже
+    если их нет в info-sheet: «Очередь-*» и «История_очереди» исключает код
+    (гибридный вариант), конфиг перечисляет только человеческие инфо-листы."""
+    client, _, _ = schedule_admin_client
+    course_info = main_module.get_course_by_id("test-course")
+    course_info["google"]["info-sheet"] = ["График"]
+
+    class FakeSheet:
+        def __init__(self, title):
+            self.title = title
+
+    class FakeSpreadsheet:
+        def worksheets(self):
+            return [
+                FakeSheet("4431"),
+                FakeSheet("4432"),
+                FakeSheet("4433К"),
+                FakeSheet("График"),
+                FakeSheet("История_очереди"),
+                FakeSheet("Очередь-2026-11-15"),
+                FakeSheet("Очередь-test-format"),
+            ]
+
+    class FakeSheetsClient:
+        def open_by_key(self, spreadsheet_id):
+            return FakeSpreadsheet()
+
+    monkeypatch.setattr(main_module, "sheets_client", lambda: FakeSheetsClient())
+
+    response = client.get("/courses/test-course/groups")
+
+    assert response.status_code == 200
+    assert response.json() == ["4431", "4432", "4433К"]
+
+
 def test_schedule_groups_endpoint_supports_prefixes_and_alphanumeric_names(
     schedule_admin_client,
 ):
@@ -407,15 +445,37 @@ def test_edit_schedule_put_rejects_mismatched_course_id(schedule_admin_client):
     assert "course-id" in response.json()["detail"]
 
 
-def test_edit_schedule_put_rejects_non_numeric_group_ids(schedule_admin_client):
+def test_edit_schedule_put_accepts_alphanumeric_group_ids(schedule_admin_client, tmp_path):
+    """Группы бывают с буквами (4433К): ограничение «только цифры» убрано,
+    идентификатор — любая непустая строка."""
+    client, _, schedule_path = schedule_admin_client
+    response = client.put(
+        "/admin/courses/test-course/schedule/edit",
+        json={
+            "content": """course-id: test-course
+groups:
+  '4433К':
+    group_id: '4433К'
+    slots: []
+manual-groups: []
+"""
+        },
+    )
+
+    assert response.status_code == 200
+    saved = yaml.safe_load(schedule_path.read_text(encoding="utf-8"))
+    assert saved["groups"]["4433К"]["group_id"] == "4433К"
+
+
+def test_edit_schedule_put_rejects_empty_group_ids(schedule_admin_client):
     client, _, _ = schedule_admin_client
     response = client.put(
         "/admin/courses/test-course/schedule/edit",
         json={
             "content": """course-id: test-course
 groups:
-  'abc':
-    group_id: 'abc'
+  '':
+    group_id: ''
     slots: []
 manual-groups: []
 """
@@ -423,7 +483,7 @@ manual-groups: []
     )
 
     assert response.status_code == 400
-    assert "цифр" in response.json()["detail"] or "digits" in response.json()["detail"]
+    assert "непустым" in response.json()["detail"]
 
 
 def test_edit_schedule_put_rejects_mismatched_group_id(schedule_admin_client):

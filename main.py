@@ -884,6 +884,11 @@ def edit_course_put(request: Request, course_id: str, data: EditCourseRequest, a
 
 
 def _is_group_sheet_title(title: str, info_sheet: str | list[str] | None) -> bool:
+    # Sheets the queue system creates itself are never groups, regardless of
+    # the config: daily queue sheets ("Очередь-<дата>", also manual ones like
+    # "Очередь-test-format") and the history sheet (issue #62 review).
+    if title.startswith(QUEUE_SHEET_PREFIX) or title == HISTORY_SHEET:
+        return False
     if isinstance(info_sheet, list):
         return not title.startswith(tuple(info_sheet))
     return title != info_sheet and re.fullmatch(r"\d+", title) is not None
@@ -3964,10 +3969,10 @@ def _validate_schedule_yaml(new_data: dict, course_id: str, old_data: dict | Non
 
     if isinstance(groups, dict):
         for configured_id, group_config in groups.items():
-            if not str(configured_id).isdigit():
+            if not str(configured_id).strip():
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Идентификатор группы {configured_id!r} должен содержать только цифры",
+                    detail="Идентификатор группы должен быть непустым",
                 )
             if not isinstance(group_config, dict):
                 raise HTTPException(
