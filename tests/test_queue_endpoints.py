@@ -168,7 +168,7 @@ def _make_admin_cookie():
     return SIGNER.sign(b"admin").decode()
 
 
-def _mock_request(cookies=None):
+def _mock_request(cookies=None, query=None):
     headers = []
     if cookies:
         for name, value in cookies.items():
@@ -179,6 +179,7 @@ def _mock_request(cookies=None):
         "path": "/",
         "headers": headers,
         "client": ("127.0.0.1", 12345),
+        "query_string": query.encode() if query else b"",
     }
     request = Request(scope, lambda: None)
     request.state.view_rate_limit = None
@@ -301,6 +302,38 @@ class TestQueueStatus:
         assert data["in_queue"] is True
         assert data["position"] == 1
         assert data["queue_size"] == 1
+
+    def test_status_finds_entry_regardless_of_lab(self, deps):
+        """Одна пара = одна очередь: запись студента на ЛР2 видна и со
+        страницы ЛР1 — лаба не участвует в поиске активной записи."""
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([2, "4431", "Alice Student", "ЛР2", "2", "alice", "10:00", STATUS_WAITING])
+
+        cookie = _make_student_cookie()
+        data = main_module.queue_status(
+            _mock_request({"student_session": cookie}),
+            "dev-course", "4431", "1",
+        )
+        assert data["in_queue"] is True
+        assert data["position"] == 2
+
+    def test_status_queue_size_is_pair_scoped(self, deps):
+        """Активная сессия guap-mon-2 -> пара 2: размер очереди считается
+        только по записям этой пары (плюс строки вообще без номера пары)."""
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([1, "4431", "Alice Student", "ЛР1", "2", "alice", "10:00", STATUS_WAITING])
+        ws.append_row([2, "4431", "Bob", "ЛР2", "2", "bob", "10:05", STATUS_WAITING])
+        # Завершённая запись другой пары дня не раздувает размер очереди пары.
+        ws.append_row([1, "4431", "Early", "ЛР1", "1", "early", "09:00", STATUS_PASSED])
+
+        cookie = _make_student_cookie()
+        data = main_module.queue_status(
+            _mock_request({"student_session": cookie}),
+            "dev-course", "4431", "1",
+        )
+        assert data["in_queue"] is True
+        assert data["position"] == 1
+        assert data["queue_size"] == 2
 
     def test_when_already_passed_in_history(self, deps):
         history = deps.worksheet("История_очереди")
@@ -713,6 +746,24 @@ class TestQueueList:
         ]
         assert all(r["group"] == "4431" for r in data["queue"])
 
+    def test_list_is_pair_scoped_across_labs(self, deps):
+        """Одна пара = одна очередь: записи разных лаб идут общим списком
+        пары; записи другой пары в список пары 2 не попадают."""
+        ws = deps.worksheet("Очередь-" + TODAY_STR)
+        ws.append_row([1, "4431", "Novikov", "ЛР2", "2", "Asteruss", "02:09", STATUS_WAITING])
+        ws.append_row([2, "4431", "Morozova", "ЛР1", "2", "hikara33", "02:12", STATUS_WAITING])
+        # Другая пара — не в этом списке.
+        ws.append_row([1, "4431", "Early", "ЛР1", "1", "early", "02:15", STATUS_WAITING])
+
+        data = main_module.queue_list(
+            _mock_request(query="session_no=2"), "dev-course", "4431", "1",
+        )
+        assert data["size"] == 2
+        assert [(r["fio"], r["lab"]) for r in data["queue"]] == [
+            ("Novikov", "ЛР2"),
+            ("Morozova", "ЛР1"),
+        ]
+
     def test_without_any_cookie_returns_queue(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
@@ -832,7 +883,7 @@ class TestQueueSetStatus:
 
 
 class TestQueueCall:
-    def test_call_next_marks_first_waiting_and_renumbers(self, deps):
+    def test_call_next_marks_first_waiting_and_keeps_positions(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
         ws.append_row([1, "4431", "Alice", "ЛР1", "", "", "", STATUS_WAITING])
         ws.append_row([2, "4431", "Bob", "ЛР1", "", "", "", STATUS_WAITING])
@@ -851,7 +902,7 @@ class TestQueueCall:
         assert rows[1][7] == STATUS_CALLED
         assert rows[1][0] == "1"  # позиция НЕ очищается — остаётся 1
         assert rows[2][7] == STATUS_WAITING
-        assert rows[2][0] == "1"  # оставшиеся ждущие перенумерованы
+        assert rows[2][0] == "2"  # перенумерации нет: билеты не меняются
 
     def test_parallel_calls_without_finishing_previous(self, deps):
         # Сценарий ревью: вызвать первого, не завершая его защиту,
@@ -876,7 +927,7 @@ class TestQueueCall:
         assert [rows[i][7] for i in (1, 2, 3)] == [
             STATUS_CALLED, STATUS_CALLED, STATUS_WAITING,
         ]
-        assert rows[3][0] == "1"  # Carol стала первой ждущей
+        assert rows[3][0] == "3"  # Carol сохраняет свой билет — первая ждущая по номеру
 
     def test_call_specific_participant_by_identifier(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)
@@ -894,7 +945,7 @@ class TestQueueCall:
 
         rows = ws.get_all_values()
         assert rows[1][7] == STATUS_WAITING
-        assert rows[1][0] == "1"  # Alice перенумерована на первую позицию
+        assert rows[1][0] == "1"  # Alice сохраняет свой билет
         assert rows[2][7] == STATUS_CALLED
 
     def test_empty_queue_returns_409(self, deps):
@@ -935,11 +986,12 @@ class TestQueueCall:
         assert data["status"] == "returned"
 
         rows = ws.get_all_values()
-        # Bob остаётся первым (позиция 1), Alice возвращается в конец (позиция 2).
+        # Bob сохраняет свой билет (2) и остаётся первым ждущим;
+        # Alice возвращается в конец с новым билетом 3 (max + 1).
         assert rows[1][7] == STATUS_WAITING
-        assert rows[1][0] == "2"
+        assert rows[1][0] == "3"
         assert rows[2][7] == STATUS_WAITING
-        assert rows[2][0] == "1"
+        assert rows[2][0] == "2"
 
     def test_uncall_not_called_returns_409(self, deps):
         ws = deps.worksheet("Очередь-" + TODAY_STR)

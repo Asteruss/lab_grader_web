@@ -274,7 +274,8 @@
     "callNext": "Call next",
     "call": "Call",
     "returnToQueue": "Return to queue",
-    "actions": "Actions"
+    "actions": "Actions",
+    "pair": "pair {{no}}"
   },
   "queue": {
     "title": "Defense queue",

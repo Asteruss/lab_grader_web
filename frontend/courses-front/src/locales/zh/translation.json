@@ -280,7 +280,8 @@
     "callNext": "叫下一位",
     "call": "叫号",
     "returnToQueue": "返回队列",
-    "actions": "操作"
+    "actions": "操作",
+    "pair": "第 {{no}} 节课"
   },
   "queue": {
     "title": "实验答辩排队",

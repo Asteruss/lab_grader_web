@@ -151,12 +151,19 @@ export const AdminQueuePage = () => {
 
   const called = queue.filter((entry) => entry.status === STATUS_CALLED);
 
-  // Unique (group, lab) pairs in the order they appear in today's sheet.
+  // One pair = one queue (issue #62 review): scope sections by (group, pair),
+  // not by lab. The lab of the first entry is only used to build the API path.
   const scopes = useMemo(() => {
     const seen = new Map();
     for (const entry of queue) {
-      const key = `${entry.group}\u0000${entry.lab}`;
-      if (!seen.has(key)) seen.set(key, { group: entry.group, lab: entry.lab });
+      const key = `${entry.group}\u0000${entry.session_no ?? ""}`;
+      if (!seen.has(key)) {
+        seen.set(key, {
+          group: entry.group,
+          session_no: entry.session_no ?? null,
+          lab: entry.lab,
+        });
+      }
     }
     return [...seen.values()];
   }, [queue]);
@@ -262,11 +269,13 @@ export const AdminQueuePage = () => {
 
           {scopes.map((scope) => {
             const entries = queue.filter(
-              (e) => e.group === scope.group && e.lab === scope.lab
+              (e) =>
+                e.group === scope.group &&
+                (e.session_no ?? null) === scope.session_no
             );
             const hasWaiting = entries.some((e) => e.status === STATUS_WAITING);
             return (
-              <Box key={`${scope.group}-${scope.lab}`} sx={{ mb: 3 }}>
+              <Box key={`${scope.group}-${scope.session_no ?? "x"}`} sx={{ mb: 3 }}>
                 <Stack
                   direction="row"
                   justifyContent="space-between"
@@ -274,7 +283,7 @@ export const AdminQueuePage = () => {
                   sx={{ mb: 1, flexWrap: "wrap" }}
                 >
                   <Typography variant="subtitle1">
-                    {scope.group} · {scope.lab}
+                    {scope.group} · {t("adminQueue.pair", { no: scope.session_no ?? "—" })}
                   </Typography>
                   <Button
                     variant="contained"

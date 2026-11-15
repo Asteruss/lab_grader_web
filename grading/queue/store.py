@@ -279,18 +279,15 @@ def read_queue_rows(worksheet) -> list[QueueRow]:
 def list_waiting(
     rows: Iterable[QueueRow],
     group: str,
-    lab: str,
     session_no: int | None = None,
 ) -> list[QueueRow]:
-    """Waiting entries for *(group, lab)*, optionally filtered by session number."""
     return sorted(
         (
             row
             for row in rows
             if row.group == group
-            and row.lab == lab
             and row.status == STATUS_WAITING
-            and (session_no is None or row.session_no == session_no)
+            and (session_no is None or row.session_no in (None, session_no))
         ),
         key=lambda row: (row.position or 0, row.row_index),
     )
@@ -310,7 +307,6 @@ def _identity_matches(
 def find_waiting(
     rows: Iterable[QueueRow],
     group: str,
-    lab: str,
     fio: str,
     session_no: int | None = None,
     github: str = "",
@@ -319,10 +315,9 @@ def find_waiting(
         row
         for row in rows
         if row.group == group
-        and row.lab == lab
         and row.fio == fio
         and row.status == STATUS_WAITING
-        and (session_no is None or row.session_no == session_no)
+        and (session_no is None or row.session_no in (None, session_no))
         and _identity_matches(row, github)
     ]
     if len(matches) > 1:
@@ -336,20 +331,18 @@ def find_waiting(
 def find_called(
     rows: Iterable[QueueRow],
     group: str,
-    lab: str,
     fio: str,
     session_no: int | None = None,
     github: str = "",
 ) -> QueueRow | None:
-    """Called (but not yet finished) entry for *(group, lab, fio)*, if any."""
+    """Called (but not yet finished) entry for *(group, fio)*, if any."""
     matches = [
         row
         for row in rows
         if row.group == group
-        and row.lab == lab
         and row.fio == fio
         and row.status == STATUS_CALLED
-        and (session_no is None or row.session_no == session_no)
+        and (session_no is None or row.session_no in (None, session_no))
         and _identity_matches(row, github)
     ]
     if len(matches) > 1:
@@ -363,7 +356,6 @@ def find_called(
 def _unique_row(
     rows: Iterable[QueueRow],
     group: str,
-    lab: str,
     fio: str,
     session_no: int | None = None,
     github: str = "",
@@ -372,10 +364,9 @@ def _unique_row(
         row
         for row in rows
         if row.group == group
-        and row.lab == lab
         and row.fio == fio
         and row.status == STATUS_WAITING
-        and (session_no is None or row.session_no == session_no)
+        and (session_no is None or row.session_no in (None, session_no))
         and _identity_matches(row, github)
     ]
     if not matches:
@@ -411,14 +402,13 @@ def list_today(
     spreadsheet,
     today: date,
     group: str,
-    lab: str,
     group_ids: Iterable[str] = (),
     session_no: int | None = None,
 ) -> list[QueueRow]:
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
         return list_waiting(
-            read_queue_rows(worksheet), group, lab, session_no
+            read_queue_rows(worksheet), group, session_no
         )
 
 
@@ -430,22 +420,6 @@ def list_today(
 def _write_cells(worksheet, updates: list[dict]) -> None:
     if updates:
         worksheet.batch_update(updates, value_input_option="RAW")
-
-
-def _renumber_waiting(
-    worksheet,
-    group: str,
-    lab: str,
-    session_no: int | None = None,
-) -> None:
-    rows = read_queue_rows(worksheet)
-    waiting = list_waiting(rows, group, lab, session_no)
-    updates = [
-        {"range": f"A{row.row_index}", "values": [[position]]}
-        for position, row in enumerate(waiting, start=1)
-        if row.position != position
-    ]
-    _write_cells(worksheet, updates)
 
 
 def register(
@@ -479,14 +453,14 @@ def register(
         if already_active:
             raise QueueError("ALREADY_IN_QUEUE", "Участник уже ожидает")
 
-        waiting = list_waiting(rows, group, lab, session_no)
-        # Position after all existing entries in this (group, lab, session) scope,
-        # including finished ones, so new entries don't collide with finished positions.
+        # Position after all existing entries in this (group, session) pair
+        # queue, including finished ones, so new entries don't collide with
+        # finished positions. The lab is only a label — the pair shares one
+        # numbering (issue #62 review).
         in_scope = [
             row
             for row in rows
             if row.group == group
-            and row.lab == lab
             and (session_no is None or row.session_no == session_no)
         ]
         max_pos = max((row.position for row in in_scope if row.position), default=0)
@@ -504,7 +478,6 @@ def withdraw(
     today: date,
     group: str,
     fio: str,
-    lab: str,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
     github: str = "",
@@ -515,7 +488,7 @@ def withdraw(
         matching = [
             row
             for row in rows
-            if row.group == group and row.lab == lab and row.fio == fio
+            if row.group == group and row.fio == fio
             and _identity_matches(row, github)
         ]
         waiting = [row for row in matching if row.status == STATUS_WAITING]
@@ -533,7 +506,6 @@ def withdraw(
             worksheet,
             [{"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WITHDRAWN]]}],
         )
-        _renumber_waiting(worksheet, group, lab, session_no)
 
 
 def shift_down(
@@ -541,12 +513,20 @@ def shift_down(
     today: date,
     group: str,
     fio: str,
-    lab: str,
     delta: int,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
     github: str = "",
 ) -> tuple[int, int]:
+    """Move a waiting participant *delta* places back in the pair queue.
+
+    Positions behave like tickets (issue #62 review): the move rotates
+    tickets only within the affected segment — every entry the mover jumps
+    over takes the ticket ahead of it, the mover takes the segment's last
+    ticket. Tickets are permuted among waiting entries only, so called and
+    finished rows keep theirs, no duplicates appear, and all other rows are
+    untouched. Returns (old, new) 1-based ranks among waiting entries.
+    """
     if isinstance(delta, bool) or not isinstance(delta, int) or delta < 1:
         raise QueueError(
             "INVALID_SHIFT", "Сдвиг вниз должен быть целым числом не меньше 1"
@@ -554,20 +534,25 @@ def shift_down(
 
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
-        waiting = list_waiting(
-            read_queue_rows(worksheet), group, lab, session_no
-        )
-        row = _unique_row(waiting, group, lab, fio, session_no, github=github)
+        rows = read_queue_rows(worksheet)
+        waiting = list_waiting(rows, group, session_no)
+        row = _unique_row(waiting, group, fio, session_no, github=github)
+        if session_no is None and row.session_no is not None:
+            # Each pair has its own queue: shift is counted inside the
+            # student's pair, not across all entries of the day.
+            session_no = row.session_no
+            waiting = list_waiting(rows, group, session_no)
         current_index = waiting.index(row)
         new_index = min(current_index + delta, len(waiting) - 1)
         if new_index == current_index:
             raise QueueError("INVALID_SHIFT", "Участник уже в конце очереди")
 
-        reordered = list(waiting)
-        reordered.insert(new_index, reordered.pop(current_index))
+        window = waiting[current_index : new_index + 1]
+        tickets = [entry.position for entry in window]
+        rotated = window[1:] + window[:1]
         updates = [
-            {"range": f"A{entry.row_index}", "values": [[position]]}
-            for position, entry in enumerate(reordered, start=1)
+            {"range": f"A{entry.row_index}", "values": [[ticket]]}
+            for entry, ticket in zip(rotated, tickets)
         ]
         _write_cells(worksheet, updates)
         return current_index + 1, new_index + 1
@@ -578,7 +563,6 @@ def set_status(
     today: date,
     group: str,
     fio: str,
-    lab: str,
     status: str,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
@@ -592,7 +576,7 @@ def set_status(
         matching = [
             row
             for row in rows
-            if row.group == group and row.lab == lab and row.fio == fio
+            if row.group == group and row.fio == fio
         ]
         # A defense result may be set for a waiting entry (called directly
         # from the sheet) or for a called one (finalizing a defense).
@@ -621,36 +605,36 @@ def call_next(
     spreadsheet,
     today: date,
     group: str,
-    lab: str,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
     fio: str | None = None,
 ) -> QueueRow:
     """Call the first waiting participant, or a specific one by *fio*.
 
-    Parallel calls are allowed: each call marks one waiting entry as
-    "вызван" (its position cell is cleared, so called entries group at
-    the top of the day view) and renumbers the remaining waiting entries
-    1..N, so the next call can happen without finishing the previous
-    defense. The called entry stays visible until a result is set.
+    The queue is scoped per pair, not per lab (issue #62 review): the
+    teacher calls the next participant of the group's pair queue regardless
+    of which lab they are defending. Parallel calls are allowed: each call
+    marks one waiting entry as "вызван" and it keeps its position —
+    positions behave like tickets and are never renumbered, the next call
+    simply picks the waiting entry with the smallest ticket. The called
+    entry stays visible until a result is set.
     """
     with locked_course(spreadsheet.id):
         worksheet = ensure_today_sheet(spreadsheet, today, group_ids)
         rows = read_queue_rows(worksheet)
-        waiting = list_waiting(rows, group, lab, session_no)
+        waiting = list_waiting(rows, group, session_no)
         if fio is None:
             if not waiting:
                 raise QueueError("NO_WAITING", "Нет ожидающих в очереди")
             row = waiting[0]
         else:
-            row = _unique_row(waiting, group, lab, fio, session_no)
+            row = _unique_row(waiting, group, fio, session_no)
         _write_cells(
             worksheet,
             [
                 {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_CALLED]]},
             ],
         )
-        _renumber_waiting(worksheet, group, lab, session_no)
         return QueueRow(
             position=row.position,
             group=row.group,
@@ -667,7 +651,6 @@ def uncall(
     today: date,
     group: str,
     fio: str,
-    lab: str,
     session_no: int | None = None,
     group_ids: Iterable[str] = (),
 ) -> None:
@@ -678,7 +661,7 @@ def uncall(
         matching = [
             row
             for row in rows
-            if row.group == group and row.lab == lab and row.fio == fio
+            if row.group == group and row.fio == fio
         ]
         called = [row for row in matching if row.status == STATUS_CALLED]
         if not called:
@@ -691,15 +674,21 @@ def uncall(
                 "Найдено несколько вызванных записей с этим ФИО",
             )
         row = called[0]
-        waiting = list_waiting(rows, group, lab, session_no)
+        # Back to the end of the pair queue: a fresh ticket (max + 1) like at
+        # registration. Positions are never renumbered (issue #62 review).
+        in_scope = [
+            r for r in rows
+            if r.group == group
+            and (session_no is None or r.session_no in (None, session_no))
+        ]
+        end_position = max((r.position for r in in_scope if r.position), default=0) + 1
         _write_cells(
             worksheet,
             [
-                {"range": f"A{row.row_index}", "values": [[len(waiting) + 1]]},
+                {"range": f"A{row.row_index}", "values": [[end_position]]},
                 {"range": f"{STATUS_COL_LETTER}{row.row_index}", "values": [[STATUS_WAITING]]},
             ],
         )
-        _renumber_waiting(worksheet, group, lab, session_no)
 
 
 

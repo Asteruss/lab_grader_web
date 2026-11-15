@@ -401,6 +401,11 @@ export function QueueSection({ courseId, groupId, labId, formData }) {
                               <Typography component="span" variant="body2">
                                 {entryName(entry) || t("queue.unnamedEntry")}
                               </Typography>
+                              {/* One queue per pair: show which lab each
+                                  participant is defending (issue #62 review). */}
+                              {entry.lab ? (
+                                <Chip size="small" variant="outlined" label={entry.lab} />
+                              ) : null}
                             </Stack>
                           }
                           secondary={entryMeta(entry, t) || undefined}
