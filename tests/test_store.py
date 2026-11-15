@@ -20,6 +20,7 @@ from grading.queue.store import (
     STATUS_WITHDRAWN,
     ensure_history_sheet,
     ensure_today_sheet,
+    ensure_today_sheet as store_ensure_today_sheet,
     find_in_history,
     find_past_queue_sheets,
     read_queue_rows,
@@ -57,11 +58,14 @@ class FakeWorksheet:
         self.values.append([str(value) for value in values])
 
     def batch_update(self, updates, **_kwargs):
+        # real gspread writes the whole values grid starting at the range
         for update in updates:
             cell_range = update["range"]
             column = ord(cell_range[0].upper()) - ord("A") + 1
             row = int(cell_range[1:])
-            self.update_cell(row, column, update["values"][0][0])
+            for i, row_vals in enumerate(update["values"]):
+                for j, value in enumerate(row_vals):
+                    self.update_cell(row + i, column + j, value)
 
 
 class FakeWorksheetNotFound(WorksheetNotFound):
@@ -172,10 +176,17 @@ def test_ensure_sheets_uses_exact_headers_and_protects_data():
     assert fio_dim["range"]["dimension"] == "COLUMNS"
     assert fio_dim["range"]["endIndex"] == QUEUE_HEADERS.index("ФИО") + 1
     assert fio_dim["properties"]["pixelSize"] == 240
-    assert any("setBasicFilter" in item for item in requests)
+    # таблица — основной фильтр; автофильтр добавляется только фолбэком
+    assert any("addTable" in item for item in requests)
+    assert all("setBasicFilter" not in item for item in requests)
     tables = [item["addTable"]["table"] for item in requests if "addTable" in item]
     assert len(tables) == 1
     assert tables[0]["name"] == "Очередь_2026_11_08"
+    # таблица резервирует свой диапазон: append при пересечении с ней
+    # дописывает после последней строки таблицы (был баг: запись вставала
+    # на строку 201) — поэтому таблица покрывает только заголовок и растёт
+    # вместе с дописанными строками.
+    assert tables[0]["range"]["endRowIndex"] == QUEUE_SHEET_ROWS
     assert [c["columnName"] for c in tables[0]["columnProperties"]] == QUEUE_HEADERS
     assert [c["columnIndex"] for c in tables[0]["columnProperties"]] == list(range(len(QUEUE_HEADERS)))
 
@@ -562,3 +573,22 @@ def test_register_same_fio_different_github_are_separate_entries():
     with pytest.raises(QueueError, match="ALREADY_IN_QUEUE"):
         register(spreadsheet, date(2026, 11, 8), "4431", "Иванов Иван", "ЛР1",
                  github="c06-ivanov-a")
+
+
+def test_setup_falls_back_to_basic_filter_when_tables_unavailable():
+    """Аккаунт без Tables: отказ addTable -> автофильтр как фолбэк."""
+    spreadsheet = FakeSpreadsheet()
+
+    def refuse_tables(body):
+        if any("addTable" in item for item in body["requests"]):
+            raise RuntimeError("Tables are not available for this account")
+        FakeSpreadsheet.batch_update(spreadsheet, body)
+
+    spreadsheet.batch_update = refuse_tables
+
+    active = store_ensure_today_sheet(spreadsheet, date(2026, 11, 8), ["4431"])
+    assert active.row_values(1) == QUEUE_HEADERS
+    requests = spreadsheet.metadata_requests
+    # отказавший addTable не записан; фолбэк-автофильтр записан
+    assert all("addTable" not in item for item in requests)
+    assert any("setBasicFilter" in item for item in requests)

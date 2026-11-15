@@ -229,55 +229,69 @@ def _setup_new_sheet(
                 "fields": "pixelSize",
             }
         })
-        # Автофильтр по заголовкам (не filter view — задача #19, п.3а): даёт
-        # сортировку/фильтр по любой колонке, в т.ч. по ЛР.
-        requests.append({
-            "setBasicFilter": {
-                "filter": {
+
+    spreadsheet.batch_update({"requests": requests})
+
+    if queue:
+        # Лист как «Таблица» Google Sheets (задача #19, п.4): таблица сама
+        # даёт сортировку/фильтр по значениям колонок (п.3а). Диапазон на
+        # все 200 строк: register пишет строки range-update'ом (НЕ
+        # values.append) ВНУТРИ декларированного диапазона — таблица
+        # покрывает их. values.append при пересечении с таблицей ставил
+        # строку «после последней строки таблицы» (был баг: запись вставала
+        # на строку 201, вне таблицы и без её фильтров).
+        #
+        # Таблица и базовый автофильтр не сосуществуют на одном диапазоне
+        # (Sheets API 400), поэтому автофильтр — фолбэк, когда Tables
+        # недоступны у аккаунта.
+        table_request = {
+            "addTable": {
+                "table": {
+                    # имена таблиц не допускают спецсимволов (дефисов) —
+                    # заменяем на подчёркивания: «Очередь_2026_11_15»
+                    "name": worksheet.title.replace("-", "_"),
                     "range": {
                         "sheetId": worksheet.id,
                         "startRowIndex": 0,
                         "endRowIndex": QUEUE_SHEET_ROWS,
                         "startColumnIndex": 0,
                         "endColumnIndex": len(QUEUE_HEADERS),
-                    }
+                    },
+                    "columnProperties": [
+                        {"columnIndex": index, "columnName": header}
+                        for index, header in enumerate(QUEUE_HEADERS)
+                    ],
                 }
             }
-        })
-
-    spreadsheet.batch_update({"requests": requests})
-
-    if queue:
-        # Лист как «Таблица» Google Sheets (задача #19, п.4). Не атомарно с
-        # основной настройкой: фича новая, у некоторых аккаунтов недоступна —
-        # её отказ не должен валить создание листа.
+        }
         try:
-            spreadsheet.batch_update({"requests": [{
-                "addTable": {
-                    "table": {
-                        # имена таблиц не допускают спецсимволов (дефисов) —
-                        # заменяем на подчёркивания: «Очередь_2026_11_15»
-                        "name": worksheet.title.replace("-", "_"),
-                        "range": {
-                            "sheetId": worksheet.id,
-                            "startRowIndex": 0,
-                            "endRowIndex": QUEUE_SHEET_ROWS,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": len(QUEUE_HEADERS),
-                        },
-                        "columnProperties": [
-                            {"columnIndex": index, "columnName": header}
-                            for index, header in enumerate(QUEUE_HEADERS)
-                        ],
-                    }
-                }
-            }]})
+            spreadsheet.batch_update({"requests": [table_request]})
         except Exception as error:
             logger.warning(
-                "addTable for %s failed (Sheets Tables may be unavailable): %s",
+                "addTable for %s failed, falling back to basic filter: %s",
                 worksheet.title,
                 error,
             )
+            try:
+                spreadsheet.batch_update({"requests": [{
+                    "setBasicFilter": {
+                        "filter": {
+                            "range": {
+                                "sheetId": worksheet.id,
+                                "startRowIndex": 0,
+                                "endRowIndex": QUEUE_SHEET_ROWS,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": len(QUEUE_HEADERS),
+                            }
+                        }
+                    }
+                }]})
+            except Exception as filter_error:
+                logger.warning(
+                    "setBasicFilter fallback for %s also failed: %s",
+                    worksheet.title,
+                    filter_error,
+                )
 
 
 # Кэш worksheet-объектов + валидации заголовков (план оптимизации, П.8/П.9).
@@ -603,14 +617,22 @@ def register(
         ]
         max_pos = max((row.position for row in in_scope if row.position), default=0)
         position = max_pos + 1
-        worksheet.append_row(
-            [position, group, fio, lab, session_no or "", github, signup_time, STATUS_WAITING],
-            value_input_option="RAW",
-            table_range="A1:H",
-        )
-        # П.11: кэш обновляется in-place — следующий регистр/просмотр видит
-        # запись без перечитывания листа.
+        # П.11 + Google Tables: запись строкой-диапазоном по вычисленному
+        # row_index, БЕЗ values.append — append при пересечении с таблицей
+        # ставит строку «после последней строки таблицы» и перезаписывает
+        # данные (потеря записи). Диапазон таблицы (A1:H200) покрывает
+        # вычисленный индекс — строка попадает внутрь таблицы.
         new_row_index = max((r.row_index for r in rows), default=1) + 1
+        _write_cells(
+            worksheet,
+            [{
+                "range": f"A{new_row_index}",
+                "values": [[
+                    position, group, fio, lab, session_no or "",
+                    github, signup_time, STATUS_WAITING,
+                ]],
+            }],
+        )
         cache.append_row_to_cache(
             spreadsheet.id, today.isoformat(),
             QueueRow(

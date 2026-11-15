@@ -78,7 +78,9 @@ class FakeWorksheet:
             rng = u["range"]
             col = ord(rng[0].upper()) - ord("A") + 1
             row = int(rng[1:])
-            self.update_cell(row, col, u["values"][0][0])
+            for i, row_vals in enumerate(u["values"]):
+                for j, value in enumerate(row_vals):
+                    self.update_cell(row + i, col + j, value)
 
 
 class FakeSpreadsheet:
